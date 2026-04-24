@@ -1,0 +1,34 @@
+services:
+    redis-db:
+        image: redis:7
+        volumes:
+            - ./data:/data
+        ports:
+            - 6379:6379
+        command: ["--save", "1", "1"]
+    FastAPI-app:
+        build:
+            context: ./
+            dockerfile: ./Dockerfile
+        depends_on:
+            - redis-db
+        image: alozano0304/api:1.1
+        ports:
+            - 5000:8000
+        environment:
+            - REDIS_HOST=redis-db
+            - REDIS_PORT=6379
+            - LOG_LEVEL=INFO
+    worker:
+        build:
+            context: ./
+            dockerfile: ./Dockerfile
+        depends_on:
+            - redis-db
+            - FastAPI-app
+        image: alozano0304/api:1.0
+        entrypoint: ["uv", "run", "worker.py"]
+        environment:
+            - REDIS_HOST=redis-db
+            - REDIS_PORT=6379
+            - LOG_LEVEL=INFO
