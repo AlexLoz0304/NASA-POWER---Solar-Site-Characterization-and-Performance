@@ -22,11 +22,11 @@ RUN uv sync
 RUN uv add fastapi[standard]
 
 # Copy all Python scripts
-COPY src/api.py /code/api.py
+COPY src/FastAPI_api.py /code/FastAPI_api.py
 COPY src/worker.py /code/worker.py
 COPY src/jobs.py /code/jobs.py
 
 ENV PATH="/code:$PATH"
 
 # Default to FastAPI app, but can be overridden with docker run --entrypoint
-CMD ["uv", "run", "--", "fastapi", "dev",  "--host", "0.0.0.0", "api.py"]
+CMD ["uv", "run", "--", "fastapi", "dev",  "--host", "0.0.0.0", "FastAPI_api.py"]

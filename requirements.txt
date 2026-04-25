@@ -1,0 +1,6 @@
+fastapi[standard]   # Web framework + uvicorn server bundled
+pydantic            # Data validation / request models
+redis               # Redis client (rd, jdb, rdb connections)
+hotqueue            # Simple Redis-backed job queue used by worker
+requests            # HTTP client for NASA POWER API calls
+pytest

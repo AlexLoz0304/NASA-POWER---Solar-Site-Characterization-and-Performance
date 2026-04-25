@@ -12,7 +12,7 @@ services:
             dockerfile: ./Dockerfile
         depends_on:
             - redis-db
-        image: alozano0304/api:1.1
+        image: nasa-power-api:1.0
         ports:
             - 5000:8000
         environment:
@@ -26,7 +26,7 @@ services:
         depends_on:
             - redis-db
             - FastAPI-app
-        image: alozano0304/api:1.0
+        image: nasa-power-worker:1.0
         entrypoint: ["uv", "run", "worker.py"]
         environment:
             - REDIS_HOST=redis-db
