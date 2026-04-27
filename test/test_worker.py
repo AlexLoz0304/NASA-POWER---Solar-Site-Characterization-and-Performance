@@ -72,61 +72,37 @@ class TestWorkerJobCompletion(unittest.TestCase):
         """Job must reach FINISHED -- SUCCESS status."""
         self.assertIn("SUCCESS", self.result["job_status"])
 
-    def test_result_has_results_key(self):
-        """Completed result must contain a 'results' dict."""
-        self.assertIn("results", self.result)
-        self.assertIsInstance(self.result["results"], dict)
-
     def test_result_has_location_info(self):
         """results.location must include lat, lon, name."""
+        self.assertIn("results", self.result)
         loc = self.result["results"]["location"]
         for field in ("lat", "lon", "name"):
             self.assertIn(field, loc)
 
-    def test_result_has_panel_orientation(self):
-        """results.panel_orientation must include tilt, azimuth, facing."""
+    def test_panel_orientation_correct(self):
+        """results.panel_orientation must have required keys, tilt=|lat|, and facing=South for Paris."""
         ori = self.result["results"]["panel_orientation"]
         for key in ("recommended_tilt_deg", "recommended_azimuth_deg", "facing"):
             self.assertIn(key, ori)
-
-    def test_tilt_equals_abs_latitude(self):
-        """Recommended tilt must equal |lat| of the stored location."""
         lat = abs(self.result["results"]["location"]["lat"])
-        tilt = self.result["results"]["panel_orientation"]["recommended_tilt_deg"]
-        self.assertAlmostEqual(tilt, lat, places=1)
+        self.assertAlmostEqual(ori["recommended_tilt_deg"], lat, places=1)
+        self.assertEqual(ori["facing"], "South")
 
-    def test_northern_hemisphere_faces_south(self):
-        """Paris (lat > 0) panels must face South."""
-        facing = self.result["results"]["panel_orientation"]["facing"]
-        self.assertEqual(facing, "South")
-
-    def test_result_has_energy_yield(self):
-        """results.energy_yield must include estimated_annual_yield_kwh_per_kwp."""
+    def test_energy_yield_valid(self):
+        """results.energy_yield must include estimated annual yield and temp_derate_factor, and yield > 0."""
         yld = self.result["results"]["energy_yield"]
         self.assertIn("estimated_annual_yield_kwh_per_kwp", yld)
         self.assertIn("temp_derate_factor", yld)
+        self.assertGreater(yld["estimated_annual_yield_kwh_per_kwp"], 0)
 
-    def test_energy_yield_is_positive(self):
-        """Estimated annual yield must be a positive number."""
-        yld = self.result["results"]["energy_yield"]["estimated_annual_yield_kwh_per_kwp"]
-        self.assertGreater(yld, 0)
-
-    def test_result_has_irradiance(self):
-        """results.irradiance must include all required sub-keys."""
+    def test_irradiance_valid(self):
+        """results.irradiance must have all required keys, positive mean, and ≥12 monthly entries."""
         irr = self.result["results"]["irradiance"]
         for key in ("mean_kwh_m2_day", "monthly_means", "best_worst_months",
                     "variability_index", "clearness_index_mean"):
             self.assertIn(key, irr)
-
-    def test_irradiance_mean_is_positive(self):
-        """Mean daily irradiance must be a positive number."""
-        mean = self.result["results"]["irradiance"]["mean_kwh_m2_day"]
-        self.assertGreater(mean, 0)
-
-    def test_monthly_means_has_12_entries(self):
-        """monthly_means must cover all calendar months in the data range (at least 12)."""
-        monthly = self.result["results"]["irradiance"]["monthly_means"]
-        self.assertGreaterEqual(len(monthly), 12)
+        self.assertGreater(irr["mean_kwh_m2_day"], 0)
+        self.assertGreaterEqual(len(irr["monthly_means"]), 12)
 
     def test_monthly_means_null_for_sentinel_only_months(self):
         """Months where all data is sentinel must be null, not omitted."""
@@ -136,37 +112,19 @@ class TestWorkerJobCompletion(unittest.TestCase):
             if val is not None:
                 self.assertGreater(val, 0, msg=f"Month {label} has non-positive mean {val}")
 
-    def test_result_has_parameter_stats(self):
-        """results.parameter_stats must cover all 10 NASA parameters."""
+    def test_parameter_stats_complete(self):
+        """results.parameter_stats must cover all 10 NASA parameters with mean, median, std, min, max, count."""
         stats = self.result["results"]["parameter_stats"]
         for param in NASA_PARAMS:
             self.assertIn(param, stats)
-
-    def test_parameter_stats_have_required_keys(self):
-        """Each parameter stats entry must include mean, median, std, min, max, count."""
-        stats = self.result["results"]["parameter_stats"]["ALLSKY_SFC_SW_DWN"]
         for key in ("mean", "median", "std", "min", "max", "count"):
-            self.assertIn(key, stats)
+            self.assertIn(key, stats["ALLSKY_SFC_SW_DWN"])
 
-    def test_result_has_temperature(self):
-        """results.temperature must be present."""
-        self.assertIn("temperature", self.result["results"])
-
-    def test_result_has_wind(self):
-        """results.wind must be present."""
-        self.assertIn("wind", self.result["results"])
-
-    def test_result_has_humidity(self):
-        """results.humidity must be present."""
-        self.assertIn("humidity", self.result["results"])
-
-    def test_result_has_cloud_cover(self):
-        """results.cloud_cover must be present."""
-        self.assertIn("cloud_cover", self.result["results"])
-
-    def test_result_has_precipitation(self):
-        """results.precipitation must be present."""
-        self.assertIn("precipitation", self.result["results"])
+    def test_result_has_all_climate_sections(self):
+        """results must include temperature, wind, humidity, cloud_cover, and precipitation."""
+        res = self.result["results"]
+        for section in ("temperature", "wind", "humidity", "cloud_cover", "precipitation"):
+            self.assertIn(section, res)
 
     def test_result_has_sentinel_counts(self):
         """results.sentinel_counts must map each parameter to an int >= 0."""
@@ -253,19 +211,21 @@ class TestWorkerMultipleJobs(unittest.TestCase):
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [cls.loc_id1, cls.loc_id2]})
         cls.jids = [job["jid"] for job in r.json()]
+        cls.results = cls._wait_all(cls.jids)
 
     @classmethod
     def tearDownClass(cls):
         for lid in (cls.loc_id1, cls.loc_id2):
             requests.delete(f"{BASE_URL}/locations/{lid}")
 
-    def _wait_all(self, timeout=90):
+    @staticmethod
+    def _wait_all(jids, timeout=90):
         results = {}
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(2)
             all_done = True
-            for jid in self.jids:
+            for jid in jids:
                 r = requests.get(f"{BASE_URL}/results/{jid}")
                 status = r.json().get("job_status", "")
                 if "SUCCESS" in status or "ERROR" in status:
@@ -278,20 +238,17 @@ class TestWorkerMultipleJobs(unittest.TestCase):
 
     def test_both_jobs_complete(self):
         """Both submitted jobs must reach SUCCESS or ERROR within timeout."""
-        results = self._wait_all()
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(self.results), 2)
 
     def test_both_jobs_succeed(self):
         """Both jobs must reach FINISHED -- SUCCESS."""
-        results = self._wait_all()
-        for jid, res in results.items():
+        for jid, res in self.results.items():
             self.assertIn("SUCCESS", res["job_status"],
                           msg=f"Job {jid} did not succeed: {res.get('job_status')}")
 
     def test_results_are_independent(self):
         """Each job must produce results for its own location."""
-        results = self._wait_all()
-        lats = [res["results"]["location"]["lat"] for res in results.values()]
+        lats = [res["results"]["location"]["lat"] for res in self.results.values()]
         # Paris ~48.5, Sydney ~-34.0 — they must differ
         self.assertNotEqual(lats[0], lats[1])
 

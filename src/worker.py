@@ -586,54 +586,14 @@ def do_work(jid: str | None = None) -> None:
     try:
         # --- Step 2: Retrieve the job metadata from db=2 ---
         job = get_job_by_id(jid)
-        loc_id = None
-
-        # The job carries lat/lon; use those to look up the location_id key.
-        # We stored the location under LOCATION_ID_PREFIX + UUID, but the job
-        # only has lat/lon directly. Resolve via a scan of location_id:* keys.
-        # This is safe because the number of stored locations is small.
-        lat = job.lat
-        lon = job.lon
-        loc_record = None
-
-        if lat is not None and lon is not None:
-            # Snap to 0.5° grid (same logic as FastAPI_api.py)
-            s_lat = round(round(lat / 0.5) * 0.5, 1)
-            s_lon = round(round(lon / 0.5) * 0.5, 1)
-            hash_key = f"{LOCATION_PREFIX}{s_lat:.1f}:{s_lon:.1f}"
-
-            # CRUD READ — fetch location hash directly by key
-            raw_hash = rd.hgetall(hash_key)
-            if raw_hash:
-                decoded = {
-                    (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
-                    for k, v in raw_hash.items()
-                }
-                loc_id = decoded.get("id")
-                loc_record = {
-                    "id":         loc_id,
-                    "key":        hash_key,
-                    "lat":        float(decoded.get("lat", s_lat)),
-                    "lon":        float(decoded.get("lon", s_lon)),
-                    "start_date": decoded.get("start_date"),
-                    "end_date":   decoded.get("end_date"),
-                    "name":       decoded.get("name"),
-                }
-                for param in NASA_PARAMETERS:
-                    if param in decoded:
-                        try:
-                            val = json.loads(decoded[param])
-                            loc_record[param] = val if isinstance(val, list) else [val]
-                        except Exception:
-                            loc_record[param] = []
-                    else:
-                        loc_record[param] = []
-
+        
+        # --- Step 2a: Read the location record using the location_id from the job ---
+        loc_record = _read_location_by_id(job.location_id)
         if loc_record is None:
-            raise ValueError(f"Could not find location record for job {jid} (lat={lat}, lon={lon})")
+            raise ValueError(f"Could not find location record for location_id={job.location_id}")
 
-        logger.info(f"[JOB RUNNING] {jid} — analysing {loc_record.get('name', f'({lat},{lon})')} "
-                    f"| {loc_record.get('n_days', len(loc_record.get('ALLSKY_SFC_SW_DWN', [])))} days")
+        logger.info(f"[JOB RUNNING] {jid} — analysing {loc_record.get('name', '(no name)')} "
+                    f"| {len(loc_record.get('ALLSKY_SFC_SW_DWN', []))} days")
 
         # --- Step 3: Run solar site characterization analysis ---
         analysis = _analyze_location(loc_record)

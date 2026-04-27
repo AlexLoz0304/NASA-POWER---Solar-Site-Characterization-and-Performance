@@ -35,14 +35,11 @@ from jobs import (
 class TestJobIDGeneration(unittest.TestCase):
     """Tests for _generate_jid — UUID factory."""
 
-    def test_generate_jid_returns_string(self):
-        """_generate_jid must return a string."""
+    def test_generate_jid_returns_nonempty_string(self):
+        """_generate_jid must return a non-empty string."""
         jid = _generate_jid()
         self.assertIsInstance(jid, str)
-
-    def test_generate_jid_is_non_empty(self):
-        """_generate_jid must return a non-empty string."""
-        self.assertTrue(len(_generate_jid()) > 0)
+        self.assertGreater(len(jid), 0)
 
     def test_generate_jid_returns_unique_ids(self):
         """Two consecutive calls must produce different UUIDs."""
@@ -57,10 +54,11 @@ class TestJobIDGeneration(unittest.TestCase):
 class TestJobInstantiation(unittest.TestCase):
     """Tests for _instantiate_job — pure Job model factory."""
 
-    def _make_job(self, status=JobStatus.QUEUED, job_type="point",
+    def _make_job(self, status=JobStatus.QUEUED,
+                  location_id="550e8400-e29b-41d4-a716-446655440000",  # Dummy UUID
                   lat=34.0, lon=-118.0, start="20250415", end="20260415"):
         jid = _generate_jid()
-        return jid, _instantiate_job(jid, status, job_type, lat, lon, start, end)
+        return jid, _instantiate_job(jid, status, location_id, lat, lon, start, end)
 
     def test_returns_job_instance(self):
         """_instantiate_job must return a Job Pydantic model."""
@@ -76,11 +74,6 @@ class TestJobInstantiation(unittest.TestCase):
         """Job.status must reflect the status argument."""
         _, job = self._make_job(status=JobStatus.QUEUED)
         self.assertEqual(job.status, JobStatus.QUEUED)
-
-    def test_job_type_is_set(self):
-        """Job.job_type must reflect the job_type argument."""
-        _, job = self._make_job(job_type="point")
-        self.assertEqual(job.job_type, "point")
 
     def test_lat_lon_are_set(self):
         """Job.lat and Job.lon must reflect the coordinate arguments."""
@@ -115,7 +108,7 @@ class TestJobPersistence(unittest.TestCase):
         """_save_job must call jdb.set with the jid as key."""
         mock_jdb.set = Mock(return_value=True)
         jid = _generate_jid()
-        job = _instantiate_job(jid, JobStatus.QUEUED, "point", 34.0, -118.0, "20250415", "20260415")
+        job = _instantiate_job(jid, JobStatus.QUEUED, "550e8400-e29b-41d4-a716-446655440000", 34.0, -118.0, "20250415", "20260415")
 
         result = _save_job(jid, job)
 
@@ -129,7 +122,7 @@ class TestJobPersistence(unittest.TestCase):
         """_save_job must serialise the job status as a JSON string value."""
         mock_jdb.set = Mock(return_value=True)
         jid = _generate_jid()
-        job = _instantiate_job(jid, JobStatus.QUEUED, "point", 34.0, -118.0, "20250415", "20260415")
+        job = _instantiate_job(jid, JobStatus.QUEUED, "550e8400-e29b-41d4-a716-446655440000", 34.0, -118.0, "20250415", "20260415")
 
         _save_job(jid, job)
 
@@ -142,7 +135,7 @@ class TestJobPersistence(unittest.TestCase):
         """_save_job must include lat and lon in the serialised payload."""
         mock_jdb.set = Mock(return_value=True)
         jid = _generate_jid()
-        job = _instantiate_job(jid, JobStatus.QUEUED, "point", 26.0, -80.0, "20250415", "20260415")
+        job = _instantiate_job(jid, JobStatus.QUEUED, "550e8400-e29b-41d4-a716-446655440000", 26.0, -80.0, "20250415", "20260415")
 
         _save_job(jid, job)
 
@@ -166,12 +159,13 @@ class TestGetJobById(unittest.TestCase):
     """Tests for get_job_by_id — deserialisation from Redis."""
 
     def _make_raw(self, jid, status=JobStatus.QUEUED,
+                  location_id="550e8400-e29b-41d4-a716-446655440000",
                   lat=34.0, lon=-118.0,
                   start_date="20250415", end_date="20260415"):
         return json.dumps({
             'jid': jid,
             'status': status.value,
-            'job_type': 'point',
+            'location_id': location_id,
             'lat': lat,
             'lon': lon,
             'start_date': start_date,
@@ -227,7 +221,8 @@ class TestJobLifecycle(unittest.TestCase):
     def _queued_raw(self, jid):
         return json.dumps({
             'jid': jid, 'status': JobStatus.QUEUED.value,
-            'job_type': 'point', 'lat': 34.0, 'lon': -118.0,
+            'location_id': '550e8400-e29b-41d4-a716-446655440000',
+            'lat': 34.0, 'lon': -118.0,
             'start_date': '20250415', 'end_date': '20260415',
             'start_time': None, 'end_time': None,
         }).encode()
@@ -261,7 +256,8 @@ class TestJobLifecycle(unittest.TestCase):
         jid = _generate_jid()
         running_raw = json.dumps({
             'jid': jid, 'status': JobStatus.RUNNING.value,
-            'job_type': 'point', 'lat': 34.0, 'lon': -118.0,
+            'location_id': '550e8400-e29b-41d4-a716-446655440000',
+            'lat': 34.0, 'lon': -118.0,
             'start_date': '20250415', 'end_date': '20260415',
             'start_time': datetime.now(timezone.utc).isoformat(), 'end_time': None,
         }).encode()
@@ -280,7 +276,8 @@ class TestJobLifecycle(unittest.TestCase):
         jid = _generate_jid()
         running_raw = json.dumps({
             'jid': jid, 'status': JobStatus.RUNNING.value,
-            'job_type': 'point', 'lat': 34.0, 'lon': -118.0,
+            'location_id': '550e8400-e29b-41d4-a716-446655440000',
+            'lat': 34.0, 'lon': -118.0,
             'start_date': '20250415', 'end_date': '20260415',
             'start_time': datetime.now(timezone.utc).isoformat(), 'end_time': None,
         }).encode()
@@ -343,119 +340,6 @@ class TestJobResults(unittest.TestCase):
         result = get_job_result(_generate_jid())
 
         self.assertIsNone(result)
-
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-from jobs import (
-    _generate_jid,
-    _instantiate_job,
-    _save_job,
-    _queue_job,
-    get_job_by_id,
-    add_job,
-    start_job,
-    update_job_status,
-    save_job_result,
-    get_job_result,
-    Job,
-    JobStatus,
-)
-
-
-class TestJobGeneration(unittest.TestCase):
-    """Test job ID generation and instantiation (legacy class — kept for coverage)."""
-
-    def test_generate_jid_returns_string(self):
-        """Test that _generate_jid returns a string."""
-        jid = _generate_jid()
-        self.assertIsInstance(jid, str)
-
-    def test_generate_jid_returns_unique_ids(self):
-        """Test that _generate_jid returns unique IDs."""
-        jid1 = _generate_jid()
-        jid2 = _generate_jid()
-        self.assertNotEqual(jid1, jid2)
-
-    def test_instantiate_job_creates_job_object(self):
-        """Test that _instantiate_job creates a proper Job object."""
-        jid = _generate_jid()
-        job = _instantiate_job(jid, JobStatus.QUEUED, "point",
-                               40.5, -74.0, "20240101", "20250101")
-        self.assertIsInstance(job, Job)
-        self.assertEqual(job.jid, jid)
-        self.assertEqual(job.status, JobStatus.QUEUED)
-        self.assertEqual(job.lat, 40.5)
-        self.assertEqual(job.lon, -74.0)
-
-    def test_instantiate_job_with_different_statuses(self):
-        """Test _instantiate_job with different job statuses."""
-        jid = _generate_jid()
-        for status in [JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.SUCCESS, JobStatus.ERROR]:
-            job = _instantiate_job(jid, status, "point",
-                                   40.5, -74.0, "20240101", "20250101")
-            self.assertEqual(job.status, status)
-
-
-class TestJobPersistence(unittest.TestCase):
-    """Test job storage and retrieval."""
-
-    @patch('jobs.jdb')
-    def test_save_job_stores_job(self, mock_jdb):
-        """Test that _save_job stores job data correctly."""
-        mock_jdb.set = Mock(return_value=True)
-
-        jid = _generate_jid()
-        job = _instantiate_job(jid, JobStatus.QUEUED, "point",
-                               40.5, -74.0, "20240101", "20250101")
-        result = _save_job(jid, job)
-
-        self.assertTrue(result)
-        call_args = mock_jdb.set.call_args
-        stored_json = call_args[0][1]
-        stored_data = json.loads(stored_json)
-        self.assertEqual(stored_data['jid'], jid)
-        self.assertEqual(stored_data['status'], JobStatus.QUEUED.value)
-
-    @patch('jobs.q')
-    def test_queue_job_adds_to_queue(self, mock_q):
-        """Test that _queue_job adds job to the queue."""
-        mock_q.put = Mock()
-
-        jid = _generate_jid()
-        result = _queue_job(jid)
-
-        self.assertTrue(result)
-        mock_q.put.assert_called_once_with(jid)
-
-    @patch('jobs.jdb')
-    def test_get_job_by_id_retrieves_job(self, mock_jdb):
-        """Test that get_job_by_id retrieves and deserializes a job."""
-        jid = _generate_jid()
-        job_data = {
-            'jid': jid,
-            'status': JobStatus.QUEUED.value,
-            'job_type': 'point',
-            'lat': 40.5,
-            'lon': -74.0,
-            'start_date': '20240101',
-            'end_date': '20250101',
-            'start_time': None,
-            'end_time': None,
-        }
-
-        mock_jdb.get = Mock(return_value=json.dumps(job_data).encode('utf-8'))
-
-        retrieved_job = get_job_by_id(jid)
-
-        self.assertEqual(retrieved_job.jid, jid)
-        self.assertEqual(retrieved_job.status, JobStatus.QUEUED)
-        self.assertEqual(retrieved_job.lat, 40.5)
-        self.assertEqual(retrieved_job.lon, -74.0)
-        mock_jdb.get.assert_called_once_with(jid)
-
 
 
 if __name__ == '__main__':

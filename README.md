@@ -110,12 +110,19 @@ uv run python test/test_jobs.py && uv run python test/test_FastAPI_api.py && uv 
 
 All tests should pass with the Docker containers running.
 
+> **⚠️ Note:** The API and worker integration tests (`test_FastAPI_api.py`, `test_worker.py`) write real data to the live Redis database. They are designed to run against a **fresh (empty) Redis instance**. If Redis already contains data from a previous test run, stale entries can cause failures (e.g. duplicate location names returning multiple results). To reset Redis before running the tests, run:
+> ```bash
+> docker compose down -v && docker compose up -d
+> ```
+> This removes the Redis volume and starts with a clean database.
+
 ## HTTP API Routes
 
 The application exposes the following endpoints:
 
 | Route | Method | Description |
 |---|---|---|
+| `/help` | GET | Return a structured JSON reference of every endpoint |
 | `/locations` | POST | Fetch a point from NASA POWER and store it as a named location |
 | `/locations` | GET | List all stored locations (id, lat, lon, name) |
 | `/locations/name/{name}` | GET | Retrieve a stored location by friendly name (case-insensitive) |
@@ -128,6 +135,46 @@ The application exposes the following endpoints:
 | `/results/{jid}` | GET | Retrieve the full solar characterization result for a completed job |
 
 ## Example API Queries and Expected Outputs
+
+### Meta
+
+#### GET /help
+
+Returns a structured JSON reference of every available endpoint — useful for quick discovery without consulting this README.
+
+```bash
+curl http://localhost:5000/help
+```
+
+Expected output (truncated):
+
+```json
+{
+  "api": "NASA POWER Solar Site Characterization",
+  "base_url": "http://localhost:5000",
+  "description": "Fetch point-level solar and climate data from NASA POWER ...",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/help",
+      "description": "Return this endpoint reference.",
+      "parameters": [],
+      "example": "curl http://localhost:5000/help"
+    },
+    {
+      "method": "POST",
+      "path": "/locations",
+      "description": "Fetch one year of daily solar/climate data ...",
+      "parameters": [
+        {"name": "lat",  "in": "body", "type": "float",  "required": true,  "description": "Latitude −90 … 90"},
+        {"name": "lon",  "in": "body", "type": "float",  "required": true,  "description": "Longitude −180 … 180"},
+        {"name": "name", "in": "body", "type": "string", "required": false, "description": "Friendly name"}
+      ],
+      "example": "curl -X POST http://localhost:5000/locations -d '{\"lat\": 34.0, ...}'"
+    }
+  ]
+}
+```
 
 ### Location Endpoints
 

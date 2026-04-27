@@ -1,5 +1,9 @@
 """
-NASA POWER — Point-focused FastAPI
+NASA POWER — Point-Redis key conventions (db=0 for locations):
+  location:{lat:.1f}:{lon:.1f}                   — Redis set: stores all location keys at this grid cell (enables multiple locations per cell).
+  location:{lat:.1f}:{lon:.1f}:{loc_id}          — Hash storing all parameter series and metadata for a specific location.
+  location_name:{name_lower}                    — Redis set: maps friendly name (lower-cased) → location keys (supports multiple locations per name).
+  location_id:{uuid}                             — Maps UUID → full location key with loc_id.sed FastAPI
 ===================================
 
 All interactions are point-level: a location is fetched from the NASA POWER
@@ -10,7 +14,7 @@ Routes
 Locations:
   POST   /locations                 — Fetch a point from NASA POWER and store it as a named location.
   GET    /locations                 — List all stored locations (id, lat, lon, name).
-  GET    /locations/name/{name}     — Retrieve a stored location by friendly name (case-insensitive).
+  GET    /locations/name/{name}     — Retrieve all stored locations by friendly name (case-insensitive, supports multiple).
   GET    /locations/{loc_id}        — Retrieve a stored location by UUID.
   GET    /locations/{lat}/{lon}     — Retrieve a stored location by snapped coordinates.
   DELETE /locations/{loc_id}        — Delete a stored location and all its Redis mappings.
@@ -21,9 +25,12 @@ Jobs:
   GET    /jobs/{jid}                — Get a single job by UUID.
   GET    /results/{jid}             — Get the full solar site characterization result of a finished job.
 
+Meta:
+  GET    /help                      — Return a structured JSON reference of every endpoint.
+
 Redis key conventions (db=0 for locations):
   location:{lat:.1f}:{lon:.1f}      — Hash storing all parameter series and metadata.
-  location_name:{name_lower}        — Maps friendly name (lower-cased) → location hash key.
+  location_name:{name_lower}        — Maps friendly name (lower-cased) → Redis set of location hash keys (supports multiple locations per name).
   location_id:{uuid}                — Maps UUID → location hash key.
 """
 
@@ -67,13 +74,18 @@ DEFAULT_END   = _end_date.strftime("%Y%m%d")    # e.g. "20260415"
 DEFAULT_START = _start_date.strftime("%Y%m%d")  # e.g. "20250415"
 
 # ---------------------------------------------------------------------------
-# Redis key format for stored locations: location:{lat:.1f}:{lon:.1f}
-# e.g.  location:40.5:-74.0
+# Redis key format for stored locations
 # Locations are persisted by the worker/API when a point fetch is performed.
 # The Redis key prefixes are defined immediately below and used as follows:
-#   LOCATION_PREFIX      -> 'location:'       (hash with per-parameter series)
-#   LOCATION_NAME_PREFIX -> 'location_name:'  (maps friendly name -> location key)
-#   LOCATION_ID_PREFIX   -> 'location_id:'    (maps UUID -> location key)
+#   LOCATION_PREFIX      -> 'location:'       (grid cells store Redis sets of location keys; individual locations are hashes)
+#   LOCATION_NAME_PREFIX -> 'location_name:'  (Redis set: maps friendly name -> multiple location keys, supports duplicate names)
+#   LOCATION_ID_PREFIX   -> 'location_id:'    (maps UUID -> full location key with loc_id)
+# 
+# Examples:
+#   location:40.5:-74.0                 — Redis set containing all location keys at grid cell (40.5, -74.0)
+#   location:40.5:-74.0:a1b2c3d4        — Redis hash storing parameters and metadata for location a1b2c3d4
+#   location_name:paris                 — Redis set containing keys of all locations named "Paris"
+#   location_id:a1b2c3d4-e5f6-...       — Maps location UUID -> location:40.5:-74.0:a1b2c3d4
 # ---------------------------------------------------------------------------
 LOCATION_PREFIX = "location:"
 LOCATION_NAME_PREFIX = "location_name:"
@@ -168,9 +180,14 @@ def _snap_to_grid(value: float, resolution: float = 0.5) -> float:
     return round(round(value / resolution) * resolution, 1)
 
 
-def _location_key(lat: float, lon: float) -> str:
-    """Redis key for a stored location: location:{lat:.1f}:{lon:.1f}"""
-    return f"{LOCATION_PREFIX}{lat:.1f}:{lon:.1f}"
+def _location_key(lat: float, lon: float, loc_id: Optional[str] = None) -> str:
+    """Redis key for a stored location: location:{lat:.1f}:{lon:.1f} or location:{lat:.1f}:{lon:.1f}:{loc_id}
+    
+    If loc_id is provided, creates a unique key for that specific location (enables multiple locations per grid cell).
+    If loc_id is omitted, returns the canonical key for that grid cell.
+    """
+    base = f"{LOCATION_PREFIX}{lat:.1f}:{lon:.1f}"
+    return f"{base}:{loc_id}" if loc_id else base
 
 
 def _fetch_point_from_nasa(lat: float, lon: float, start_date: str, end_date: str) -> dict:
@@ -222,9 +239,9 @@ def _save_location_record(lat: float, lon: float, start_date: str, end_date: str
     """
     s_lat = _snap_to_grid(lat)
     s_lon = _snap_to_grid(lon)
-    key = _location_key(s_lat, s_lon)
     # generate a stable unique id for this stored location
     loc_id = str(uuid.uuid4())
+    key = _location_key(s_lat, s_lon, loc_id)  # Include loc_id in key to support multiple locations per grid cell
     mapping = {
         "id": loc_id,
         "lat": str(s_lat),
@@ -239,8 +256,11 @@ def _save_location_record(lat: float, lon: float, start_date: str, end_date: str
         mapping[p] = json.dumps(lst)
     if name:
         mapping["name"] = name.strip()
-        # store a case-insensitive name -> key map
-        rd.set(f"{LOCATION_NAME_PREFIX}{name.strip().lower()}", key)
+        # store a case-insensitive name -> location keys mapping (supports multiple locations with same name)
+        rd.sadd(f"{LOCATION_NAME_PREFIX}{name.strip().lower()}", key)
+    # Also store in a Redis set for this grid cell so GET /locations/{lat}/{lon} can find all locations at this cell
+    grid_cell_key = _location_key(s_lat, s_lon)  # Base key without loc_id
+    rd.sadd(grid_cell_key, key)
     # persist the mapping and an id->key map for later lookup
     rd.hset(key, mapping=mapping)
     rd.set(f"{LOCATION_ID_PREFIX}{loc_id}", key)
@@ -311,6 +331,7 @@ def post_location(req: LocationCreate) -> Location:
       start_date      — YYYYMMDD start of the data range (default: one year ago).
       end_date        — YYYYMMDD end of the data range (default: yesterday).
       name            — Optional friendly name; enables GET /locations/name/{name}.
+                        Multiple locations can share the same name (different coords/timeframes).
 
     Returns the stored Location record including all 10 NASA parameter lists.
     """
@@ -337,16 +358,34 @@ def post_location(req: LocationCreate) -> Location:
 
 @app.get("/locations/name/{name}")
 def get_location_by_name(name: str) -> dict:
-    """Return a stored location by friendly name (case-insensitive)."""
+    """Return all stored locations by friendly name (case-insensitive).
+    
+    Supports multiple locations with the same name. Each location record
+    includes its id, coordinates, timeframe (start_date/end_date), and 
+    all parameter data.
+    """
     try:
-        mapped = rd.get(f"{LOCATION_NAME_PREFIX}{name.strip().lower()}")
-        if not mapped:
+        name_key = f"{LOCATION_NAME_PREFIX}{name.strip().lower()}"
+        location_keys = rd.smembers(name_key)
+        
+        if not location_keys:
             raise HTTPException(status_code=404, detail=f"Location name '{name}' not found")
-        key = mapped.decode() if isinstance(mapped, bytes) else mapped
-        rec = _read_location_hash(key)
-        if not rec:
-            raise HTTPException(status_code=404, detail=f"Location name '{name}' resolved to '{key}' but record missing")
-        return {"location": rec}
+        
+        locations = []
+        for key in location_keys:
+            key_str = key.decode() if isinstance(key, bytes) else key
+            rec = _read_location_hash(key_str)
+            if rec:
+                locations.append(rec)
+        
+        if not locations:
+            raise HTTPException(status_code=404, detail=f"Location name '{name}' resolved but no records found")
+        
+        # Return single location if only one, otherwise return list
+        if len(locations) == 1:
+            return {"location": locations[0]}
+        else:
+            return {"locations": locations}
     except redis.ConnectionError as e:
         raise HTTPException(status_code=500, detail=f"Redis connection error: {e}")
     except HTTPException:
@@ -422,9 +461,9 @@ def list_locations() -> dict:
 def delete_location_by_id(loc_id: str) -> dict:
     """Delete a stored location by UUID id.
 
-    This removes the Redis hash for the location, the id->key mapping and
-    the case-insensitive name->key mapping if the location had a friendly
-    name set when created.
+    This removes the Redis hash for the location, the id->key mapping, and
+    removes this location from the name->keys set if it had a friendly name.
+    Other locations with the same name remain accessible.
     """
     try:
         mapped = rd.get(f"{LOCATION_ID_PREFIX}{loc_id}")
@@ -435,15 +474,24 @@ def delete_location_by_id(loc_id: str) -> dict:
         # Read the record (may be None if hash already missing)
         rec = _read_location_hash(key)
 
-        # If a friendly name exists, remove the name -> key mapping
+        # If a friendly name exists, remove this location from the name -> keys set
         if rec:
             name_val = rec.get("name")
             if isinstance(name_val, str) and name_val.strip():
                 try:
                     name_map_key = f"{LOCATION_NAME_PREFIX}{name_val.strip().lower()}"
-                    rd.delete(name_map_key)
+                    rd.srem(name_map_key, key)
                 except Exception:
                     logger.warning(f"DELETE /locations/{loc_id}: failed to remove name map for {name_val}")
+            
+            # Also remove from the grid cell set
+            lat = float(rec.get("lat", 0.0))
+            lon = float(rec.get("lon", 0.0))
+            grid_cell_key = _location_key(lat, lon)
+            try:
+                rd.srem(grid_cell_key, key)
+            except Exception:
+                logger.warning(f"DELETE /locations/{loc_id}: failed to remove from grid cell set {grid_cell_key}")
 
         # Delete the location hash and the id -> key mapping
         try:
@@ -467,19 +515,22 @@ def delete_location_by_id(loc_id: str) -> dict:
 
 @app.get("/locations/{lat}/{lon}")
 def get_location_data(lat: float, lon: float) -> dict:
-    """Return the full stored record for the grid cell nearest to the supplied coordinates.
+    """Return all stored locations for the grid cell nearest to the supplied coordinates.
 
     Coordinates are automatically snapped to the nearest 0.5° NASA POWER grid
     cell centre before the Redis lookup, so (40.71, -74.01) resolves to the
-    same cell as (40.5, -74.0).
+    same cell as (40.5, -74.0). Multiple locations may exist at the same grid cell
+    with different timeframes or names.
 
     Args:
         lat (float): Latitude  in decimal degrees.
         lon (float): Longitude in decimal degrees.
 
     Returns:
-        dict: Full location record with top-level parameter lists plus
-              queried_lat, queried_lon, snapped_lat, snapped_lon transparency fields.
+        dict: 
+            - If single location: wrapped in "location" key with transparency fields
+            - If multiple locations: wrapped in "locations" key (list) with transparency fields
+            Each location includes top-level parameter lists plus start_date/end_date/name.
 
     Raises:
         HTTPException 404: No location stored for this grid cell — run POST /locations first.
@@ -494,29 +545,49 @@ def get_location_data(lat: float, lon: float) -> dict:
         # Snap to nearest 0.5° grid cell to match stored location keys
         snapped_lat = _snap_to_grid(lat)
         snapped_lon = _snap_to_grid(lon)
-        key = _location_key(snapped_lat, snapped_lon)
+        grid_cell_key = _location_key(snapped_lat, snapped_lon)
 
-        logger.debug(f"GET /locations/{lat}/{lon}: snapped to ({snapped_lat}, {snapped_lon}) key={key}")
+        logger.debug(f"GET /locations/{lat}/{lon}: snapped to ({snapped_lat}, {snapped_lon}) key={grid_cell_key}")
 
-        val = rd.hgetall(key)
-        if not val:
+        # Get all location keys for this grid cell
+        location_keys = rd.smembers(grid_cell_key)
+        if not location_keys:
             raise HTTPException(
                 status_code=404,
                 detail=(
                     f"No solar data for grid cell ({snapped_lat}, {snapped_lon}). "
-                    "Run POST /data for a global fetch, or POST /jobs for this "
-                    "specific coordinate."
+                    "Run POST /locations for this coordinate."
                 ),
             )
 
-        record = _read_location_hash(key)
-        assert record is not None  # key exists — checked above via hgetall
-        # Add transparency fields so the caller knows what snapping occurred
-        record["queried_lat"] = lat
-        record["queried_lon"] = lon
-        record["snapped_lat"] = snapped_lat
-        record["snapped_lon"] = snapped_lon
-        return record
+        locations = []
+        for key in location_keys:
+            key_str = key.decode() if isinstance(key, bytes) else key
+            record = _read_location_hash(key_str)
+            if record:
+                locations.append(record)
+        
+        if not locations:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Grid cell ({snapped_lat}, {snapped_lon}) resolved but no readable locations found"
+            )
+        
+        # Return single location if only one, otherwise return list
+        # Always include transparency fields at response level
+        response_data: dict = {
+            "queried_lat": lat,
+            "queried_lon": lon,
+            "snapped_lat": snapped_lat,
+            "snapped_lon": snapped_lon,
+        }
+        
+        if len(locations) == 1:
+            response_data["location"] = locations[0]
+        else:
+            response_data["locations"] = locations
+        
+        return response_data
 
     except redis.ConnectionError as e:
         raise HTTPException(status_code=500, detail=f"Redis connection error: {e}")
@@ -568,7 +639,7 @@ def post_job(req: JobRequest) -> List[Job]:
             job_end = req.end_date or rec.get("end_date") or DEFAULT_END
 
             job = add_job(
-                job_type="point",
+                location_id=loc_id,
                 lat=lat,
                 lon=lon,
                 start_date=job_start,
@@ -639,6 +710,164 @@ def get_job(jid: str) -> Job:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/help")
+def get_help() -> dict:
+    """Return a structured reference of every available API endpoint.
+
+    Useful for quick discovery without consulting the README.  The response
+    lists every route with its HTTP method, path, a short description, any
+    path / body parameters, and an example curl command.
+
+    Returns:
+        dict: {
+            "api": "NASA POWER Solar Site Characterization",
+            "base_url": "http://localhost:5000",
+            "endpoints": [ { method, path, description, parameters, example }, ... ]
+        }
+    """
+    return {
+        "api": "NASA POWER Solar Site Characterization",
+        "base_url": "http://localhost:5000",
+        "description": (
+            "Fetch point-level solar and climate data from NASA POWER, store named "
+            "locations in Redis, and run asynchronous solar site characterization jobs "
+            "via a background worker."
+        ),
+        "endpoints": [
+            {
+                "method": "GET",
+                "path": "/help",
+                "description": "Return this endpoint reference.",
+                "parameters": [],
+                "example": "curl http://localhost:5000/help",
+            },
+            {
+                "method": "POST",
+                "path": "/locations",
+                "description": (
+                    "Fetch one year of daily solar/climate data for a coordinate from "
+                    "NASA POWER and store it as a named location. Coordinates are "
+                    "snapped to the nearest 0.5° grid cell."
+                ),
+                "parameters": [
+                    {"name": "lat",        "in": "body", "type": "float",  "required": True,  "description": "Latitude  −90 … 90"},
+                    {"name": "lon",        "in": "body", "type": "float",  "required": True,  "description": "Longitude −180 … 180"},
+                    {"name": "name",       "in": "body", "type": "string", "required": False, "description": "Friendly name for the location (supports duplicates)"},
+                    {"name": "start_date", "in": "body", "type": "string", "required": False, "description": "YYYYMMDD start of data window (default: 1 year ago)"},
+                    {"name": "end_date",   "in": "body", "type": "string", "required": False, "description": "YYYYMMDD end of data window (default: 10 days ago)"},
+                ],
+                "example": (
+                    'curl -X POST http://localhost:5000/locations '
+                    '-H "Content-Type: application/json" '
+                    '-d \'{"lat": 34.0, "lon": -118.0, "name": "LosAngeles"}\''
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/locations",
+                "description": "List all stored locations (id, lat, lon, name). Does not include parameter time-series.",
+                "parameters": [],
+                "example": "curl http://localhost:5000/locations",
+            },
+            {
+                "method": "GET",
+                "path": "/locations/name/{name}",
+                "description": (
+                    "Retrieve stored location(s) by friendly name (case-insensitive). "
+                    "Returns {'location': ...} for a single match or {'locations': [...]} "
+                    "when multiple records share the same name."
+                ),
+                "parameters": [
+                    {"name": "name", "in": "path", "type": "string", "required": True, "description": "Friendly name (case-insensitive)"},
+                ],
+                "example": "curl http://localhost:5000/locations/name/LosAngeles",
+            },
+            {
+                "method": "GET",
+                "path": "/locations/{loc_id}",
+                "description": "Retrieve the full location record (including all parameter time-series) by UUID.",
+                "parameters": [
+                    {"name": "loc_id", "in": "path", "type": "string (UUID)", "required": True, "description": "Location UUID returned by POST /locations"},
+                ],
+                "example": "curl http://localhost:5000/locations/9a8dee41-100e-40ba-ac77-a585a94378c5",
+            },
+            {
+                "method": "GET",
+                "path": "/locations/{lat}/{lon}",
+                "description": (
+                    "Retrieve stored location(s) at the grid cell nearest to the supplied "
+                    "coordinates. Always includes queried_lat/lon and snapped_lat/lon "
+                    "transparency fields. Returns {'location': ...} or {'locations': [...]}."
+                ),
+                "parameters": [
+                    {"name": "lat", "in": "path", "type": "float", "required": True, "description": "Latitude  in decimal degrees"},
+                    {"name": "lon", "in": "path", "type": "float", "required": True, "description": "Longitude in decimal degrees"},
+                ],
+                "example": "curl http://localhost:5000/locations/34.0/-118.0",
+            },
+            {
+                "method": "DELETE",
+                "path": "/locations/{loc_id}",
+                "description": "Delete a stored location and all its Redis mappings (hash, name index, id index, grid-cell set entry).",
+                "parameters": [
+                    {"name": "loc_id", "in": "path", "type": "string (UUID)", "required": True, "description": "Location UUID to delete"},
+                ],
+                "example": "curl -X DELETE http://localhost:5000/locations/9a8dee41-100e-40ba-ac77-a585a94378c5",
+            },
+            {
+                "method": "POST",
+                "path": "/jobs",
+                "description": (
+                    "Queue solar site characterization jobs for one or more stored location UUIDs. "
+                    "One RQ job is created per location_id. Poll GET /results/{jid} for the result."
+                ),
+                "parameters": [
+                    {"name": "location_ids", "in": "body", "type": "list[string]", "required": True,  "description": "One or more location UUIDs (non-empty)"},
+                    {"name": "start_date",   "in": "body", "type": "string",       "required": False, "description": "Override YYYYMMDD start (defaults to stored location date)"},
+                    {"name": "end_date",     "in": "body", "type": "string",       "required": False, "description": "Override YYYYMMDD end   (defaults to stored location date)"},
+                ],
+                "example": (
+                    'curl -X POST http://localhost:5000/jobs '
+                    '-H "Content-Type: application/json" '
+                    '-d \'{"location_ids": ["9a8dee41-100e-40ba-ac77-a585a94378c5"]}\''
+                ),
+            },
+            {
+                "method": "GET",
+                "path": "/jobs",
+                "description": "List all jobs (QUEUED / RUNNING / FINISHED -- SUCCESS / FINISHED -- ERROR).",
+                "parameters": [],
+                "example": "curl http://localhost:5000/jobs",
+            },
+            {
+                "method": "GET",
+                "path": "/jobs/{jid}",
+                "description": "Retrieve status and timing details for a specific job by its UUID.",
+                "parameters": [
+                    {"name": "jid", "in": "path", "type": "string (UUID)", "required": True, "description": "Job UUID returned by POST /jobs"},
+                ],
+                "example": "curl http://localhost:5000/jobs/df89de06-8729-40af-815e-cd3a74a6cc3e",
+            },
+            {
+                "method": "GET",
+                "path": "/results/{jid}",
+                "description": (
+                    "Retrieve the full solar characterization result for a finished job. "
+                    "Response varies by job state: queued → status message; "
+                    "running → status + start_time; "
+                    "error → status + timestamps; "
+                    "success → full result dict (panel orientation, energy yield, "
+                    "irradiance breakdown, parameter stats, sentinel counts, etc.)."
+                ),
+                "parameters": [
+                    {"name": "jid", "in": "path", "type": "string (UUID)", "required": True, "description": "Job UUID"},
+                ],
+                "example": "curl http://localhost:5000/results/df89de06-8729-40af-815e-cd3a74a6cc3e",
+            },
+        ],
+    }
+
+
 @app.get("/results/{jid}")
 def get_results(jid: str) -> dict:
     """Retrieve the solar site characterization result of a finished job.
@@ -670,7 +899,6 @@ def get_results(jid: str) -> dict:
         if job.status == "QUEUED":
             return {
                 "job_id":     jid,
-                "job_type":   job.job_type,
                 "job_status": job.status,
                 "message":    "Job is queued — waiting for the worker to pick it up.",
             }
@@ -678,7 +906,6 @@ def get_results(jid: str) -> dict:
         if job.status == "RUNNING":
             return {
                 "job_id":     jid,
-                "job_type":   job.job_type,
                 "job_status": job.status,
                 "start_time": str(job.start_time),
                 "message":    "Job is currently running — check back soon.",
@@ -687,7 +914,6 @@ def get_results(jid: str) -> dict:
         if job.status.startswith("FINISHED -- ERROR"):
             return {
                 "job_id":     jid,
-                "job_type":   job.job_type,
                 "job_status": job.status,
                 "start_time": str(job.start_time),
                 "end_time":   str(job.end_time),
@@ -708,7 +934,6 @@ def get_results(jid: str) -> dict:
             return {
                 "status":     "success",
                 "job_id":     jid,
-                "job_type":   job.job_type,
                 "job_status": job.status,
                 "start_time": str(job.start_time),
                 "end_time":   str(job.end_time),

@@ -4,9 +4,7 @@ jobs.py — Redis-backed job management for the NASA POWER Solar API
 Provides the Job data model, Redis connections, and helper functions used by
 both FastAPI_api.py (to create and queue jobs) and worker.py (to execute them).
 
-Two job types are supported:
-    "regional" — Fetches global daily solar data via the NASA POWER regional
-                 endpoint (10 parameters × tiled globe).  lat/lon are None.
+Supports point jobs:
     "point"    — Fetches all 10 parameters for a single lat/lon coordinate via
                  the NASA POWER daily point endpoint.
 
@@ -83,9 +81,9 @@ class Job(BaseModel):
     Fields:
         jid        — Unique job identifier (UUID string).
         status     — Current lifecycle state (see JobStatus enum).
-        job_type   — "regional" (global tile fetch) or "point" (single coordinate).
-        lat        — Latitude  in decimal degrees — None for regional jobs.
-        lon        — Longitude in decimal degrees — None for regional jobs.
+        location_id — UUID of the location to analyze (stored as location_id:{uuid} in Redis db=0).
+        lat        — Latitude  in decimal degrees (cached from location record).
+        lon        — Longitude in decimal degrees (cached from location record).
         start_date — NASA POWER date range start (YYYYMMDD string).
         end_date   — NASA POWER date range end   (YYYYMMDD string).
         start_time — UTC wall-clock time when the worker began processing.
@@ -93,9 +91,9 @@ class Job(BaseModel):
     """
     jid:        str
     status:     JobStatus
-    job_type:   str                        # "regional" or "point"
-    lat:        Optional[float] = None     # None for regional jobs
-    lon:        Optional[float] = None     # None for regional jobs
+    location_id: str  # UUID identifying the specific location to analyze
+    lat:        Optional[float] = None
+    lon:        Optional[float] = None
     start_date: Optional[str]  = None
     end_date:   Optional[str]  = None
     start_time: Optional[datetime] = None  # Set by start_job() when worker picks it up
@@ -118,7 +116,8 @@ def _generate_jid() -> str:
     return jid
 
 
-def _instantiate_job(jid: str, status: JobStatus, job_type: str,
+def _instantiate_job(jid: str, status: JobStatus,
+                     location_id: str,
                      lat: Optional[float], lon: Optional[float],
                      start_date: Optional[str], end_date: Optional[str]) -> Job:
     """
@@ -130,11 +129,11 @@ def _instantiate_job(jid: str, status: JobStatus, job_type: str,
     Args:
         jid        (str):            Job UUID.
         status     (JobStatus):      Initial status (typically QUEUED).
-        job_type   (str):            "regional" or "point".
-        lat        (float | None):   Target latitude  — None for regional jobs.
-        lon        (float | None):   Target longitude — None for regional jobs.
-        start_date (str | None):     NASA POWER start date (YYYYMMDD).
-        end_date   (str | None):     NASA POWER end   date (YYYYMMDD).
+        location_id (str):           UUID of the location to analyze.
+        lat        (float):          Target latitude (cached from location).
+        lon        (float):          Target longitude (cached from location).
+        start_date (str):            NASA POWER start date (YYYYMMDD).
+        end_date   (str):            NASA POWER end   date (YYYYMMDD).
 
     Returns:
         Job: A fully populated (but not yet persisted) Job instance.
@@ -142,15 +141,15 @@ def _instantiate_job(jid: str, status: JobStatus, job_type: str,
     job = Job(
         jid=jid,
         status=status,
-        job_type=job_type,
+        location_id=location_id,
         lat=lat,
         lon=lon,
         start_date=start_date,
         end_date=end_date,
     )
     logger.debug(
-        f"Instantiated {job_type} job {jid}: "
-        f"({'global' if lat is None else f'({lat}, {lon})'})  "
+        f"Instantiated point job {jid}: "
+        f"location_id={location_id}  ({lat}, {lon})  "
         f"[{start_date} -> {end_date}]  status={status}"
     )
     return job
@@ -230,23 +229,23 @@ def get_job_by_id(jid: str) -> Job:
         raise
 
 
-def add_job(job_type: str,
+def add_job(location_id: str,
             lat: Optional[float] = None,
             lon: Optional[float] = None,
             start_date: Optional[str] = None,
             end_date:   Optional[str] = None) -> Job:
     """
-    Create a new job, persist it in Redis db=2, and enqueue it for the worker.
+    Create a new point job, persist it in Redis db=2, and enqueue it for the worker.
 
-    Called by POST /data (job_type="regional") and POST /jobs (job_type="point").
+    Called by POST /jobs.
     The returned Job will have status=QUEUED and no start/end timestamps yet.
 
     Args:
-        job_type   (str):          "regional" or "point".
-        lat        (float | None): Target latitude  — None for regional jobs.
-        lon        (float | None): Target longitude — None for regional jobs.
-        start_date (str | None):   NASA POWER start date (YYYYMMDD).
-        end_date   (str | None):   NASA POWER end   date (YYYYMMDD).
+        location_id (str):         UUID of the location to analyze.
+        lat        (float):        Target latitude (cached from location).
+        lon        (float):        Target longitude (cached from location).
+        start_date (str):          NASA POWER start date (YYYYMMDD).
+        end_date   (str):          NASA POWER end   date (YYYYMMDD).
 
     Returns:
         Job: The newly created Job object with status QUEUED.
@@ -255,7 +254,7 @@ def add_job(job_type: str,
     job = _instantiate_job(
         jid=jid,
         status=JobStatus.QUEUED,
-        job_type=job_type,
+        location_id=location_id,
         lat=lat,
         lon=lon,
         start_date=start_date,
@@ -265,8 +264,8 @@ def add_job(job_type: str,
     _queue_job(jid)       # Push jid onto HotQueue so worker picks it up
 
     logger.info(
-        f"Queued {job_type} job {jid}: "
-        f"{'global' if lat is None else f'({lat}, {lon})'}  "
+        f"Queued point job {jid}: "
+        f"location_id={location_id}  ({lat}, {lon})  "
         f"[{start_date} -> {end_date}]"
     )
     return job
