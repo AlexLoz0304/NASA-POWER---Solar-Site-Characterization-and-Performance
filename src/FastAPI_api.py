@@ -28,10 +28,6 @@ Jobs:
 Meta:
   GET    /help                      — Return a structured JSON reference of every endpoint.
 
-Redis key conventions (db=0 for locations):
-  location:{lat:.1f}:{lon:.1f}      — Hash storing all parameter series and metadata.
-  location_name:{name_lower}        — Maps friendly name (lower-cased) → Redis set of location hash keys (supports multiple locations per name).
-  location_id:{uuid}                — Maps UUID → location hash key.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -159,7 +155,7 @@ class JobRequest(BaseModel):
     @root_validator(skip_on_failure=True)
     def require_location_ids(cls, values):
         locs = values.get('location_ids')
-        if not locs or len(locs) == 0:
+        if not locs:
             raise ValueError('location_ids must contain at least one id')
         return values
 
@@ -280,48 +276,33 @@ def _save_location_record(lat: float, lon: float, start_date: str, end_date: str
 
 
 def _read_location_hash(key: str) -> Optional[dict]:
-    """
-    Read a Redis location/hash key and return a normalized record.
-
-    This single helper replaces the previous two helpers and always
-    returns a dict with these top-level fields when the key exists:
-      - id (str|None): UUID assigned when the location was created (may be None)
-      - key (str): the Redis key passed in
-      - lat, lon (float)
-      - start_date, end_date (str|None)
-      - name (str|None)
-      - one top-level list field for each NASA parameter (or None)
-
-    Returns None if the key does not exist.
-    """
+    """Read a Redis location hash and return a normalized record, or None if missing."""
     raw = rd.hgetall(key)
     if not raw:
         return None
-    decoded = { (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items() }
+
+    decode = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+         for k, v in raw.items()}
+
     rec = {
-        "id": decoded.get("id"),
-        "key": key,
-        "lat": float(decoded.get("lat", 0.0)),
-        "lon": float(decoded.get("lon", 0.0)),
-        "start_date": decoded.get("start_date"),
-        "end_date": decoded.get("end_date"),
-        "name": decoded.get("name"),
+        "id":         decode.get("id"),
+        "key":        key,
+        "lat":        float(decode.get("lat", 0.0)),
+        "lon":        float(decode.get("lon", 0.0)),
+        "start_date": decode.get("start_date"),
+        "end_date":   decode.get("end_date"),
+        "name":       decode.get("name"),
     }
+
     for p in NASA_PARAMETERS:
-        if p in decoded:
-            try:
-                val = json.loads(decoded[p])
-                if isinstance(val, list):
-                    rec[p] = val
-                elif isinstance(val, dict):
-                    rec[p] = _series_to_list(val)
-                else:
-                    rec[p] = [val]
-            except Exception:
-                rec[p] = [decoded[p]]
-        else:
+        try:
+            rec[p] = _series_to_list(json.loads(decode[p])) if p in decode else None
+        except Exception:
             rec[p] = None
+
     return rec
+
+
 @app.post("/locations", status_code=201)
 def post_location(req: LocationCreate) -> Location:
     """Fetch a single point from NASA POWER and persist it as a known location.
