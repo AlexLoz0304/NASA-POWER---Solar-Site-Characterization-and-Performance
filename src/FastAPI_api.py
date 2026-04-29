@@ -31,7 +31,7 @@ Meta:
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, root_validator, field_validator, model_validator
 from jobs import Job, add_job, get_job_by_id, jdb, rd, get_job_result
 import json
 import redis
@@ -41,6 +41,7 @@ import requests as http_requests
 from datetime import datetime
 from typing import Optional, List
 import uuid
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -121,6 +122,28 @@ class LocationCreate(BaseModel):
     end_date: Optional[str] = Field(DEFAULT_END)
     name: Optional[str] = None
 
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def validate_date_format(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            try:
+                parsed = datetime.strptime(v, '%Y%m%d').date()
+            except ValueError:
+                raise ValueError('date must be in YYYYMMDD format (e.g. 20250101)')
+            if parsed > datetime.utcnow().date():
+                raise ValueError('date cannot be in the future')
+        return v
+
+    @model_validator(mode='after')
+    def validate_date_range(self) -> 'LocationCreate':
+        start, end = self.start_date, self.end_date
+        if start and end:
+            s = datetime.strptime(start, '%Y%m%d').date()
+            e = datetime.strptime(end, '%Y%m%d').date()
+            if s >= e:
+                raise ValueError('start_date must be strictly before end_date')
+        return self
+
 
 class Location(BaseModel):
     id: str
@@ -186,8 +209,18 @@ def _location_key(lat: float, lon: float, loc_id: Optional[str] = None) -> str:
     return f"{base}:{loc_id}" if loc_id else base
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=16),
+    retry=retry_if_exception_type((http_requests.Timeout, http_requests.ConnectionError)),
+    reraise=True,
+)
 def _fetch_point_from_nasa(lat: float, lon: float, start_date: str, end_date: str) -> dict:
-    """Call NASA POWER point endpoint and return parameter dict."""
+    """Call NASA POWER point endpoint and return parameter dict.
+
+    Retries up to 3 times with exponential backoff on transient network errors
+    (Timeout, ConnectionError). HTTP 4xx/5xx errors are not retried.
+    """
     params_str = ",".join(NASA_PARAMETERS)
     resp = http_requests.get(
         NASA_POWER_POINT_URL,
@@ -324,7 +357,7 @@ def post_location(req: LocationCreate) -> Location:
         logger.info(f"POST /locations: stored id={record['id']} key={record['key']} range={start}→{end}")
         return Location(**record)
 
-    except http_requests.HTTPError as e:
+    except http_requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"NASA POWER API error: {e}")
     except redis.ConnectionError as e:
         raise HTTPException(status_code=500, detail=f"Redis connection error: {e}")
@@ -518,10 +551,10 @@ def get_location_data(lat: float, lon: float) -> dict:
         HTTPException 422: Coordinates outside the accepted Americas range.
     """
     try:
-        if not (15.0 <= lat <= 75.0):
-            raise HTTPException(status_code=422, detail="lat must be between 15.0 and 75.0 (Americas coverage)")
-        if not (-170.0 <= lon <= -50.0):
-            raise HTTPException(status_code=422, detail="lon must be between -170.0 and -50.0 (Americas coverage)")
+        if not (-90.0 <= lat <= 90.0):
+            raise HTTPException(status_code=422, detail="lat must be between -90 and 90")
+        if not (-180.0 <= lon <= 180.0):
+            raise HTTPException(status_code=422, detail="lon must be between -180 and 180")
 
         # Snap to nearest 0.5° grid cell to match stored location keys
         snapped_lat = _snap_to_grid(lat)
@@ -689,6 +722,24 @@ def get_job(jid: str) -> Job:
     except Exception as e:
         logger.error(f"GET /jobs/{jid}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+def health_check() -> dict:
+    """Return application health status and Redis connectivity.
+
+    Always returns HTTP 200. Check the 'status' field: 'ok' or 'degraded'.
+    """
+    try:
+        rd.ping()
+        redis_status = "ok"
+    except Exception:
+        redis_status = "error"
+    return {
+        "status": "ok" if redis_status == "ok" else "degraded",
+        "redis": redis_status,
+        "nasa_power_url": NASA_POWER_POINT_URL,
+    }
 
 
 @app.get("/help")

@@ -323,6 +323,28 @@ def _solar_variability_index(irradiance_series: list) -> Optional[float]:
     return round(statistics.stdev(cleaned) / m, 4)
 
 
+def _ghi_suitability_score(mean_ghi: float) -> dict:
+    """GHI-based PV site suitability score from 0–10.
+
+    Calibrated so that 7 kWh/m²/day (high-desert irradiance) scores 10.
+    Useful for ranking candidate sites at a glance.
+    """
+    score = round(min(10.0, mean_ghi * 10.0 / 7.0), 1)
+    if score >= 8:
+        label = "Excellent"
+    elif score >= 6:
+        label = "Good"
+    elif score >= 4:
+        label = "Moderate"
+    else:
+        label = "Poor"
+    return {
+        "score": score,
+        "label": label,
+        "note": "Score 0–10: ≥8 Excellent, ≥6 Good, ≥4 Moderate, <4 Poor. 7 kWh/m²/day = 10.",
+    }
+
+
 def _best_worst_months(monthly_means: dict) -> dict:
     """
     Return the calendar month with the highest and lowest mean irradiance.
@@ -483,6 +505,13 @@ def _analyze_location(record: dict) -> dict:
         },
         # Days with missing NASA POWER data (sentinel = -999)
         "sentinel_counts": sentinel_counts,
+        # Peak sun hours = mean daily GHI numerically (1 kWh/m²/day ≡ 1 PSH)
+        "peak_sun_hours": {
+            "daily_average": mean_irr,
+            "note": "Peak sun hours/day ≈ mean GHI (kWh/m²/day). Use to size PV arrays: array_kWp = daily_load_kWh / PSH.",
+        },
+        # Simple GHI-based site suitability score for quick comparison
+        "pv_suitability": _ghi_suitability_score(mean_irr),
     }
     return result
 

@@ -4,3 +4,5 @@ redis               # Redis client (rd, jdb, rdb connections)
 hotqueue            # Simple Redis-backed job queue used by worker
 requests            # HTTP client for NASA POWER API calls
 pytest
+tenacity            # Retry logic with exponential backoff for transient NASA POWER failures
+httpx               # Async HTTP client used by FastAPI TestClient in unit tests
