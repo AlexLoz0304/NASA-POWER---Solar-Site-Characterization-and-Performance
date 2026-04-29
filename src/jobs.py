@@ -175,6 +175,7 @@ def _save_job(jid: str, job: Job) -> bool:
     """
     try:
         jdb.set(jid, json.dumps(job.model_dump(mode="json")))
+        jdb.expire(jid, 7 * 24 * 3600)  # auto-expire stale jobs after 7 days
         logger.debug(f"Saved job {jid} to db=2 with status {job.status}")
         return True
     except Exception as e:
