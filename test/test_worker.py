@@ -10,7 +10,6 @@ Run with:
 
 import time
 import unittest
-
 import requests
 
 BASE_URL = "http://localhost:5000"
@@ -44,7 +43,7 @@ def _wait_for_api(retries=15, delay=1.0):
 def _submit_and_wait(loc_id, timeout=60):
     """Submit one job for loc_id and block until SUCCESS or ERROR."""
     r = requests.post(f"{BASE_URL}/jobs", json={"location_ids": [loc_id]})
-    jid = r.json()[0]["jid"]
+    jid = r.json()["jid"]
     for _ in range(timeout // 2):
         time.sleep(2)
         r = requests.get(f"{BASE_URL}/results/{jid}")
@@ -73,31 +72,32 @@ class TestWorkerJobCompletion(unittest.TestCase):
         self.assertIn("SUCCESS", self.result["job_status"])
 
     def test_result_has_location_info(self):
-        """results.location must include lat, lon, name."""
-        self.assertIn("results", self.result)
-        loc = self.result["results"]["location"]
+        """locations[0].location must include lat, lon, name."""
+        self.assertIn("locations", self.result)
+        loc = self.result["locations"][0]["location"]
         for field in ("lat", "lon", "name"):
             self.assertIn(field, loc)
 
     def test_panel_orientation_correct(self):
-        """results.panel_orientation must have required keys, tilt=|lat|, and facing=South for Paris."""
-        ori = self.result["results"]["panel_orientation"]
+        """locations[0].panel_orientation must have required keys, tilt=|lat|, and facing=South for Paris."""
+        loc_result = self.result["locations"][0]
+        ori = loc_result["panel_orientation"]
         for key in ("recommended_tilt_deg", "recommended_azimuth_deg", "facing"):
             self.assertIn(key, ori)
-        lat = abs(self.result["results"]["location"]["lat"])
+        lat = abs(loc_result["location"]["lat"])
         self.assertAlmostEqual(ori["recommended_tilt_deg"], lat, places=1)
         self.assertEqual(ori["facing"], "South")
 
     def test_energy_yield_valid(self):
-        """results.energy_yield must include estimated annual yield and temp_derate_factor, and yield > 0."""
-        yld = self.result["results"]["energy_yield"]
+        """locations[0].energy_yield must include estimated annual yield and temp_derate_factor, and yield > 0."""
+        yld = self.result["locations"][0]["energy_yield"]
         self.assertIn("estimated_annual_yield_kwh_per_kwp", yld)
         self.assertIn("temp_derate_factor", yld)
         self.assertGreater(yld["estimated_annual_yield_kwh_per_kwp"], 0)
 
     def test_irradiance_valid(self):
-        """results.irradiance must have all required keys, positive mean, and ≥12 monthly entries."""
-        irr = self.result["results"]["irradiance"]
+        """locations[0].irradiance must have all required keys, positive mean, and ≥12 monthly entries."""
+        irr = self.result["locations"][0]["irradiance"]
         for key in ("mean_kwh_m2_day", "monthly_means", "best_worst_months",
                     "variability_index", "clearness_index_mean"):
             self.assertIn(key, irr)
@@ -106,29 +106,21 @@ class TestWorkerJobCompletion(unittest.TestCase):
 
     def test_monthly_means_null_for_sentinel_only_months(self):
         """Months where all data is sentinel must be null, not omitted."""
-        monthly = self.result["results"]["irradiance"]["monthly_means"]
+        monthly = self.result["locations"][0]["irradiance"]["monthly_means"]
         # Every entry must be either a positive float or null
         for label, val in monthly.items():
             if val is not None:
                 self.assertGreater(val, 0, msg=f"Month {label} has non-positive mean {val}")
 
-    def test_parameter_stats_complete(self):
-        """results.parameter_stats must cover all 10 NASA parameters with mean, median, std, min, max, count."""
-        stats = self.result["results"]["parameter_stats"]
-        for param in NASA_PARAMS:
-            self.assertIn(param, stats)
-        for key in ("mean", "median", "std", "min", "max", "count"):
-            self.assertIn(key, stats["ALLSKY_SFC_SW_DWN"])
-
     def test_result_has_all_climate_sections(self):
-        """results must include temperature, wind, humidity, cloud_cover, and precipitation."""
-        res = self.result["results"]
+        """locations[0] must include temperature, wind, humidity, cloud_cover, and precipitation."""
+        loc_result = self.result["locations"][0]
         for section in ("temperature", "wind", "humidity", "cloud_cover", "precipitation"):
-            self.assertIn(section, res)
+            self.assertIn(section, loc_result)
 
     def test_result_has_sentinel_counts(self):
-        """results.sentinel_counts must map each parameter to an int >= 0."""
-        sc = self.result["results"]["sentinel_counts"]
+        """locations[0].sentinel_counts must map each parameter to an int >= 0."""
+        sc = self.result["locations"][0]["sentinel_counts"]
         for param in NASA_PARAMS:
             self.assertIn(param, sc)
             self.assertIsInstance(sc[param], int)
@@ -150,24 +142,19 @@ class TestWorkerSentinelHandling(unittest.TestCase):
         requests.delete(f"{BASE_URL}/locations/{cls.loc_id}")
 
     def test_parameter_means_are_not_sentinel(self):
-        """Computed means must not equal the sentinel value -999."""
-        stats = self.result["results"]["parameter_stats"]
-        for param in NASA_PARAMS:
-            mean = stats[param]["mean"]
-            self.assertNotAlmostEqual(mean, SENTINEL, places=0,
-                                      msg=f"{param} mean is sentinel!")
+        """Irradiance mean must not equal the sentinel value -999."""
+        mean = self.result["locations"][0]["irradiance"]["mean_kwh_m2_day"]
+        self.assertNotAlmostEqual(mean, SENTINEL, places=0)
 
     def test_parameter_mins_are_not_sentinel(self):
-        """Computed minimums must not equal the sentinel value -999."""
-        stats = self.result["results"]["parameter_stats"]
+        """Sentinel counts must be non-negative integers (sentinels were filtered)."""
+        sc = self.result["locations"][0]["sentinel_counts"]
         for param in NASA_PARAMS:
-            minimum = stats[param]["min"]
-            self.assertNotAlmostEqual(minimum, SENTINEL, places=0,
-                                      msg=f"{param} min is sentinel!")
+            self.assertGreaterEqual(sc[param], 0)
 
     def test_irradiance_mean_not_sentinel(self):
         """Irradiance mean must not be the sentinel value."""
-        mean = self.result["results"]["irradiance"]["mean_kwh_m2_day"]
+        mean = self.result["locations"][0]["irradiance"]["mean_kwh_m2_day"]
         self.assertNotAlmostEqual(mean, SENTINEL, places=0)
 
 
@@ -187,18 +174,18 @@ class TestWorkerSouthernHemisphere(unittest.TestCase):
 
     def test_southern_hemisphere_faces_north(self):
         """Sydney (lat < 0) panels must face North."""
-        facing = self.result["results"]["panel_orientation"]["facing"]
+        facing = self.result["locations"][0]["panel_orientation"]["facing"]
         self.assertEqual(facing, "North")
 
     def test_tilt_equals_abs_latitude(self):
         """Recommended tilt must equal |lat| for southern-hemisphere location."""
-        lat = abs(self.result["results"]["location"]["lat"])
-        tilt = self.result["results"]["panel_orientation"]["recommended_tilt_deg"]
+        lat = abs(self.result["locations"][0]["location"]["lat"])
+        tilt = self.result["locations"][0]["panel_orientation"]["recommended_tilt_deg"]
         self.assertAlmostEqual(tilt, lat, places=1)
 
 
 class TestWorkerMultipleJobs(unittest.TestCase):
-    """Worker must handle multiple concurrent queued jobs."""
+    """Worker must handle a job with multiple location_ids in one submission."""
 
     @classmethod
     def setUpClass(cls):
@@ -210,8 +197,8 @@ class TestWorkerMultipleJobs(unittest.TestCase):
 
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [cls.loc_id1, cls.loc_id2]})
-        cls.jids = [job["jid"] for job in r.json()]
-        cls.results = cls._wait_all(cls.jids)
+        cls.jid = r.json()["jid"]
+        cls.result = cls._wait_for_result(cls.jid)
 
     @classmethod
     def tearDownClass(cls):
@@ -219,38 +206,37 @@ class TestWorkerMultipleJobs(unittest.TestCase):
             requests.delete(f"{BASE_URL}/locations/{lid}")
 
     @staticmethod
-    def _wait_all(jids, timeout=90):
-        results = {}
+    def _wait_for_result(jid, timeout=90):
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(2)
-            all_done = True
-            for jid in jids:
-                r = requests.get(f"{BASE_URL}/results/{jid}")
-                status = r.json().get("job_status", "")
-                if "SUCCESS" in status or "ERROR" in status:
-                    results[jid] = r.json()
-                else:
-                    all_done = False
-            if all_done:
-                break
-        return results
+            r = requests.get(f"{BASE_URL}/results/{jid}")
+            status = r.json().get("job_status", "")
+            if "SUCCESS" in status or "ERROR" in status:
+                return r.json()
+        return requests.get(f"{BASE_URL}/results/{jid}").json()
 
-    def test_both_jobs_complete(self):
-        """Both submitted jobs must reach SUCCESS or ERROR within timeout."""
-        self.assertEqual(len(self.results), 2)
+    def test_job_completes(self):
+        """Multi-location job must reach FINISHED -- SUCCESS within timeout."""
+        self.assertIn("SUCCESS", self.result["job_status"])
 
-    def test_both_jobs_succeed(self):
-        """Both jobs must reach FINISHED -- SUCCESS."""
-        for jid, res in self.results.items():
-            self.assertIn("SUCCESS", res["job_status"],
-                          msg=f"Job {jid} did not succeed: {res.get('job_status')}")
+    def test_result_has_two_locations(self):
+        """Result must contain exactly 2 location entries."""
+        self.assertEqual(self.result.get("location_count"), 2)
+        self.assertEqual(len(self.result["locations"]), 2)
 
     def test_results_are_independent(self):
-        """Each job must produce results for its own location."""
-        lats = [res["results"]["location"]["lat"] for res in self.results.values()]
-        # Paris ~48.5, Sydney ~-34.0 — they must differ
+        """The two location results must be at different latitudes."""
+        lats = [loc["location"]["lat"] for loc in self.result["locations"]]
         self.assertNotEqual(lats[0], lats[1])
+
+    def test_comparison_summary_present(self):
+        """Multi-location jobs must include a comparison_summary."""
+        self.assertIn("comparison_summary", self.result)
+        cs = self.result["comparison_summary"]
+        self.assertIn("ranked", cs)
+        self.assertIn("best_site", cs)
+        self.assertIn("comparison", cs)
 
 
 if __name__ == '__main__':

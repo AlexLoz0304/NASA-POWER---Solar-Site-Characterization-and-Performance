@@ -77,6 +77,177 @@ To stop the containers:
 docker compose down
 ```
 
+## Instructions to run on Kubernetes
+
+The `kubernetes/` directory contains manifests for deploying the full stack (FastAPI, worker, Redis) to a Kubernetes cluster. Two environments are provided:
+
+| Environment | Directory | Replicas | Log Level | Ingress Host |
+|---|---|---|---|---|
+| **Production** | `kubernetes/prod/` | 2 (API + worker) | `INFO` | `alozano0304-nasa-power.coe332.tacc.cloud` |
+| **Test** | `kubernetes/test/` | 1 (API + worker) | `DEBUG` | `alozano0304-nasa-power-test.coe332.tacc.cloud` |
+
+### Kubernetes manifest overview
+
+Each environment contains the following 8 files, applied in this order:
+
+| File | Kind | Purpose |
+|---|---|---|
+| `app-{env}-pvc-redis.yml` | PersistentVolumeClaim | Persistent disk for Redis data (prod: 2Gi, test: 1Gi) |
+| `app-{env}-deployment-redis.yml` | Deployment | Redis pod with persistence enabled (`--save 1 1`) |
+| `app-{env}-service-redis.yml` | Service (ClusterIP) | Internal service so API and worker can reach Redis |
+| `app-{env}-deployment-FastAPI.yml` | Deployment | FastAPI application pod(s) |
+| `app-{env}-service-FastAPI.yml` | Service (ClusterIP) | Internal service for FastAPI |
+| `app-{env}-service-nodeport-FastAPI.yml` | Service (NodePort) | Exposes FastAPI to the Ingress controller |
+| `app-{env}-deployment-worker.yml` | Deployment | Background worker pod(s) running `worker.py` |
+| `app-{env}-ingress-FastAPI.yml` | Ingress | Routes public HTTP traffic to the NodePort service |
+
+### Prerequisites
+
+- Access to a Kubernetes cluster (e.g. TACC COE332)
+- `kubectl` configured with valid credentials (`~/.kube/config`)
+- A Docker Hub account with your own images pushed (see [Customising for your own deployment](#customising-for-your-own-deployment) below)
+
+### Customising for your own deployment
+
+The manifests are pre-configured with the original author's Docker Hub username (`alozano0304`) and TACC ingress hostname. Before deploying, replace these with your own values:
+
+**1. Docker Hub username** — appears in the `image:` field of the three deployment files. Change `alozano0304` to your Docker Hub username:
+
+| File | Line to change |
+|---|---|
+| `kubernetes/prod/app-prod-deployment-FastAPI.yml` | `image: alozano0304/nasa-power-api:1.0` |
+| `kubernetes/prod/app-prod-deployment-worker.yml` | `image: alozano0304/nasa-power-worker:1.0` |
+| `kubernetes/test/app-test-deployment-FastAPI.yml` | `image: alozano0304/nasa-power-api:1.0` |
+| `kubernetes/test/app-test-deployment-worker.yml` | `image: alozano0304/nasa-power-worker:1.0` |
+| `docker-compose.yml` | `image: alozano0304/nasa-power-api:1.0` and `image: alozano0304/nasa-power-worker:1.0` |
+
+You can do this in one command with `sed`:
+
+```bash
+# Replace throughout all kubernetes manifests and docker-compose
+find kubernetes/ docker-compose.yml -type f | xargs sed -i 's/alozano0304/<your-dockerhub-username>/g'
+```
+
+Then rebuild and push the images under your own username:
+
+```bash
+docker compose build
+docker compose push
+```
+
+**2. Ingress hostname** — appears in the `host:` field of the two ingress files. Change the hostname to match your cluster's domain:
+
+| File | Line to change |
+|---|---|
+| `kubernetes/prod/app-prod-ingress-FastAPI.yml` | `host: "alozano0304-nasa-power.coe332.tacc.cloud"` |
+| `kubernetes/test/app-test-ingress-FastAPI.yml` | `host: "alozano0304-nasa-power-test.coe332.tacc.cloud"` |
+
+Replace `alozano0304` with your own username and `coe332.tacc.cloud` with your cluster's domain. For example:
+
+```yaml
+# kubernetes/prod/app-prod-ingress-FastAPI.yml
+host: "<your-username>-nasa-power.<your-cluster-domain>"
+
+# kubernetes/test/app-test-ingress-FastAPI.yml
+host: "<your-username>-nasa-power-test.<your-cluster-domain>"
+```
+
+> **Note:** If your cluster uses a different `ingressClassName` than `nginx`, update that field too in both ingress files.
+
+### Deploy to the test environment
+
+```bash
+# Apply all test manifests at once
+kubectl apply -f kubernetes/test/
+```
+
+Or step-by-step in dependency order:
+
+```bash
+kubectl apply -f kubernetes/test/app-test-pvc-redis.yml
+kubectl apply -f kubernetes/test/app-test-deployment-redis.yml
+kubectl apply -f kubernetes/test/app-test-service-redis.yml
+kubectl apply -f kubernetes/test/app-test-deployment-FastAPI.yml
+kubectl apply -f kubernetes/test/app-test-service-FastAPI.yml
+kubectl apply -f kubernetes/test/app-test-service-nodeport-FastAPI.yml
+kubectl apply -f kubernetes/test/app-test-deployment-worker.yml
+kubectl apply -f kubernetes/test/app-test-ingress-FastAPI.yml
+```
+
+### Deploy to the production environment
+
+```bash
+kubectl apply -f kubernetes/prod/
+```
+
+### Verify everything is running
+
+```bash
+# Check all pods are in Running state
+kubectl get pods
+
+# Check services
+kubectl get services
+
+# Check the Ingress and its assigned address
+kubectl get ingress
+```
+
+Expected pod output (test environment):
+
+```
+NAME                                      READY   STATUS    RESTARTS   AGE
+nasa-power-test-redis-<hash>              1/1     Running   0          1m
+nasa-power-test-fastapi-<hash>            1/1     Running   0          1m
+nasa-power-test-worker-<hash>             1/1     Running   0          1m
+```
+
+### Access the API
+
+Once the Ingress is active, the API is reachable at the public hostname:
+
+```bash
+# Test environment
+curl http://alozano0304-nasa-power-test.coe332.tacc.cloud/help
+
+# Production environment
+curl http://alozano0304-nasa-power.coe332.tacc.cloud/help
+```
+
+### View logs
+
+```bash
+# Stream logs from the FastAPI pods
+kubectl logs -l app=nasa-power-test-fastapi -f
+
+# Stream logs from the worker pods
+kubectl logs -l app=nasa-power-test-worker -f
+```
+
+### Tear down an environment
+
+```bash
+# Remove all test resources
+kubectl delete -f kubernetes/test/
+
+# To also wipe the Redis persistent volume (deletes all stored data):
+kubectl delete pvc nasa-power-test-redis-data
+```
+
+### Updating the image
+
+When a new version of the app is ready, rebuild, push, and trigger a rolling restart:
+
+```bash
+# Rebuild and push both images
+docker compose build
+docker compose push
+
+# Trigger a rolling restart so Kubernetes pulls the new image
+kubectl rollout restart deployment/nasa-power-prod-fastapi
+kubectl rollout restart deployment/nasa-power-prod-worker
+```
+
 ## Running Tests
 
 The project includes unit and integration tests to verify functionality at multiple levels.
@@ -86,27 +257,28 @@ The project includes unit and integration tests to verify functionality at multi
 With Docker containers running, execute all test suites:
 
 ```bash
-# Unit tests (job queue functions)
-uv run python test/test_jobs.py
+# Unit tests — no live server required (mocks Redis)
+uv run pytest test/test_jobs.py test/test_api_unit.py -v
 
-# API integration tests (HTTP endpoints)
+# API integration tests — requires containers running
 uv run python test/test_FastAPI_api.py
 
-# Worker integration tests (job processing)
+# Worker integration tests — requires containers running
 uv run python test/test_worker.py
 ```
 
-Or run all tests together:
+Or run the full suite together:
 
 ```bash
-uv run python test/test_jobs.py && uv run python test/test_FastAPI_api.py && uv run python test/test_worker.py
+uv run pytest test/ -v
 ```
 
 ### Test summary
 
-- **test_jobs.py** — Unit tests for job queue operations with mocked Redis dependencies.
-- **test_FastAPI_api.py** — Integration tests for all 9 API endpoints using HTTP requests.
-- **test_worker.py** — Integration tests verifying the worker computes and stores solar characterization results end-to-end.
+- **test_jobs.py** — Unit tests for all job queue operations (`add_job`, `get_job_by_id`, `start_job`, `update_job_status`, `save_job_result`, `get_job_result`) using mocked Redis. Also validates the multi-location result structure and `comparison_summary` shape.
+- **test_api_unit.py** — Unit tests for the FastAPI application with mocked Redis and NASA POWER calls. Validates coordinate validation, date validation, job submission (single Job response), and polling endpoints.
+- **test_FastAPI_api.py** — Integration tests for all HTTP endpoints against the live running containers. Covers location CRUD, multi-location name/coordinate lookups, job submission (single-Job response shape), and result polling.
+- **test_worker.py** — Integration tests verifying the worker correctly computes and stores combined solar characterization results end-to-end, including single-location results, southern-hemisphere panel orientation, sentinel filtering, and multi-location comparison summaries.
 
 All tests should pass with the Docker containers running.
 
@@ -123,16 +295,18 @@ The application exposes the following endpoints:
 | Route | Method | Description |
 |---|---|---|
 | `/help` | GET | Return a structured JSON reference of every endpoint |
+| `/health` | GET | Return Redis connectivity and application health status |
 | `/locations` | POST | Fetch a point from NASA POWER and store it as a named location |
 | `/locations` | GET | List all stored locations (id, lat, lon, name) |
-| `/locations/name/{name}` | GET | Retrieve a stored location by friendly name (case-insensitive) |
+| `/locations/name/{name}` | GET | Retrieve stored location(s) by friendly name (case-insensitive) |
 | `/locations/{loc_id}` | GET | Retrieve a stored location by UUID |
-| `/locations/{lat}/{lon}` | GET | Retrieve a stored location by snapped coordinates |
+| `/locations/{lat}/{lon}` | GET | Retrieve stored location(s) by snapped coordinates |
 | `/locations/{loc_id}` | DELETE | Delete a stored location and all its Redis mappings |
-| `/jobs` | POST | Queue solar characterization jobs for one or more location UUIDs |
+| `/jobs` | POST | Queue **one job** for all supplied location UUIDs; returns a single Job |
 | `/jobs` | GET | List all queued / running / finished jobs |
 | `/jobs/{jid}` | GET | Retrieve details for a specific job by its UUID |
-| `/results/{jid}` | GET | Retrieve the full solar characterization result for a completed job |
+| `/results/{jid}` | GET | Retrieve the combined solar characterization result for a completed job |
+| `/results/{jid}/plot` | GET | Return the daily irradiance overlay PNG for a completed job |
 
 ## Example API Queries and Expected Outputs
 
@@ -295,11 +469,11 @@ Expected output:
 
 ### Job Queue Endpoints
 
-The job queue system allows you to submit asynchronous solar site characterization analyses. Jobs are queued in Redis and processed by the background worker service, which reads the stored time-series data and computes a full set of solar engineering metrics.
+The job queue system allows you to submit asynchronous solar site characterization analyses. A single POST /jobs request creates **one job** that covers all supplied location UUIDs. The background worker reads the stored time-series data for every location, computes a full set of solar engineering metrics, generates a combined irradiance overlay plot, and saves the result to Redis db=3.
 
 #### POST /jobs
 
-Submit characterization jobs for one or more stored location UUIDs. One job is created per location.
+Submit a characterization job for one or more stored location UUIDs. **One job is always created**, regardless of how many locations are supplied. The combined result (all locations in one response) is available via `GET /results/{jid}` once the job completes.
 
 ```bash
 curl -X POST http://localhost:5000/jobs \
@@ -307,14 +481,18 @@ curl -X POST http://localhost:5000/jobs \
   -d '{"location_ids": ["7fe1e7cd-...", "9a8dee41-...", "b0e5c1e7-..."]}'
 ```
 
-Expected output:
+Expected output (single Job object):
 
 ```json
-[
-  {"jid": "df89de06-...", "status": "QUEUED", "job_type": "point", "lat": 40.5, "lon": -74.0, "start_date": "20250415", "end_date": "20260415", "start_time": null, "end_time": null},
-  {"jid": "b50ba419-...", "status": "QUEUED", "job_type": "point", "lat": 34.0, "lon": -118.0, "start_date": "20250415", "end_date": "20260415", "start_time": null, "end_time": null},
-  {"jid": "e5b8770b-...", "status": "QUEUED", "job_type": "point", "lat": 26.0, "lon": -80.0, "start_date": "20250415", "end_date": "20260415", "start_time": null, "end_time": null}
-]
+{
+  "jid": "df89de06-8729-40af-815e-cd3a74a6cc3e",
+  "status": "QUEUED",
+  "location_ids": ["7fe1e7cd-...", "9a8dee41-...", "b0e5c1e7-..."],
+  "start_date": null,
+  "end_date": null,
+  "start_time": null,
+  "end_time": null
+}
 ```
 
 #### GET /jobs
@@ -332,13 +510,11 @@ Expected output (truncated):
   {
     "jid": "df89de06-...",
     "status": "FINISHED -- SUCCESS",
-    "job_type": "point",
-    "lat": 40.5,
-    "lon": -74.0,
-    "start_date": "20250415",
-    "end_date": "20260415",
-    "start_time": "2026-04-25T07:12:04.123456",
-    "end_time": "2026-04-25T07:12:04.789012"
+    "location_ids": ["7fe1e7cd-..."],
+    "start_date": null,
+    "end_date": null,
+    "start_time": "2026-04-25T07:12:04.123456+00:00",
+    "end_time": "2026-04-25T07:12:08.789012+00:00"
   }
 ]
 ```
@@ -357,17 +533,17 @@ Expected output:
 {
   "jid": "df89de06-...",
   "status": "FINISHED -- SUCCESS",
-  "job_type": "point",
-  "lat": 40.5,
-  "lon": -74.0,
-  "start_time": "2026-04-25T07:12:04.123456",
-  "end_time": "2026-04-25T07:12:04.789012"
+  "location_ids": ["7fe1e7cd-..."],
+  "start_date": null,
+  "end_date": null,
+  "start_time": "2026-04-25T07:12:04.123456+00:00",
+  "end_time": "2026-04-25T07:12:08.789012+00:00"
 }
 ```
 
 #### GET /results/{jid}
 
-Retrieve the full solar site characterization result for a completed job.
+Retrieve the combined solar site characterization result for a completed job.
 
 **For a job still queued or running:**
 
@@ -378,64 +554,96 @@ curl http://localhost:5000/results/df89de06-8729-40af-815e-cd3a74a6cc3e
 Expected output:
 
 ```json
-{"job_id": "df89de06-...", "job_type": "point", "job_status": "RUNNING", "message": "Job is currently running — check back soon."}
+{"job_id": "df89de06-...", "job_status": "RUNNING", "message": "Job is currently running — check back soon."}
 ```
 
-**For a completed job:**
+**For a completed job (single location):**
 
 ```json
 {
   "status": "success",
   "job_id": "df89de06-...",
   "job_status": "FINISHED -- SUCCESS",
-  "start_time": "2026-04-25T07:12:04.123456",
-  "end_time": "2026-04-25T07:12:04.789012",
-  "results": {
-    "location": {
-      "id": "7fe1e7cd-...",
-      "lat": 40.5,
-      "lon": -74.0,
-      "name": "NewYork",
-      "start_date": "20250415",
-      "end_date": "20260415",
-      "n_days": 261
-    },
-    "panel_orientation": {
-      "recommended_tilt_deg": 40.5,
-      "recommended_azimuth_deg": 180.0,
-      "facing": "south",
-      "note": "Fixed-tilt rule-of-thumb: tilt ≈ |lat| = 40.5° facing south."
-    },
-    "energy_yield": {
-      "estimated_annual_yield_kwh_per_kwp": 882.11,
-      "performance_ratio_used": 0.78,
-      "temp_derate_factor": 1.0,
-      "delta_t_above_stc_c": 0.0
-    },
-    "irradiance": {
-      "mean_kwh_m2_day": 4.333,
-      "monthly_means": {"2025-04": 4.81, "2025-05": 5.72, "2025-07": 6.23, "2025-12": 1.68},
-      "best_worst_months": {
-        "best_month":  {"month": "2025-07", "mean_kwh_m2_day": 6.2315},
-        "worst_month": {"month": "2025-12", "mean_kwh_m2_day": 1.6838}
+  "start_time": "2026-04-25T07:12:04.123456+00:00",
+  "end_time": "2026-04-25T07:12:08.789012+00:00",
+  "location_count": 1,
+  "locations": [
+    {
+      "location": {
+        "id": "7fe1e7cd-...",
+        "lat": 40.5,
+        "lon": -74.0,
+        "name": "NewYork",
+        "start_date": "20250415",
+        "end_date": "20260415",
+        "n_days": 366
       },
-      "variability_index": 0.5021,
-      "clearness_index_mean": 0.5073,
-      "clear_sky_utilisation": 0.507
-    },
-    "temperature": {"mean_c": 12.18, "max_c": 31.97, "min_c": -13.61},
-    "wind":         {"mean_ws10m_m_s": 5.34},
-    "humidity":     {"mean_rh2m_pct": 67.2},
-    "cloud_cover":  {"mean_cloud_amt_pct": 49.8},
-    "precipitation":{"mean_mm_day": 2.91},
-    "sentinel_counts": {"ALLSKY_SFC_SW_DWN": 105, "T2M": 0}
+      "panel_orientation": {
+        "recommended_tilt_deg": 40.5,
+        "recommended_azimuth_deg": 180.0,
+        "facing": "South",
+        "note": "Fixed-tilt rule-of-thumb: tilt ≈ |lat| = 40.5° facing south."
+      },
+      "energy_yield": {
+        "estimated_annual_yield_kwh_per_kwp": 882.11,
+        "performance_ratio_used": 0.78,
+        "temp_derate_factor": 1.0,
+        "delta_t_above_stc_c": 0.0
+      },
+      "irradiance": {
+        "mean_kwh_m2_day": 4.333,
+        "monthly_means": {"2025-04": 4.81, "2025-05": 5.72, "2025-12": 1.68},
+        "best_worst_months": {
+          "best_month":  {"month": "2025-07", "mean_kwh_m2_day": 6.23},
+          "worst_month": {"month": "2025-12", "mean_kwh_m2_day": 1.68}
+        },
+        "variability_index": 0.5021,
+        "clearness_index_mean": 0.5073,
+        "clear_sky_utilisation": 0.507
+      },
+      "temperature":   {"mean_c": 12.18, "max_c": 31.97, "min_c": -13.61},
+      "wind":          {"mean_ws10m_m_s": 5.34},
+      "humidity":      {"mean_rh2m_pct": 67.2},
+      "cloud_cover":   {"mean_cloud_amt_pct": 49.8},
+      "precipitation": {"mean_mm_day": 2.91},
+      "sentinel_counts": {"ALLSKY_SFC_SW_DWN": 0, "T2M": 0},
+      "peak_sun_hours": {"daily_average": 4.333, "note": "..."},
+      "pv_suitability": {"score": 3, "label": "Moderate", "mean_ghi": 4.333}
+    }
+  ]
+}
+```
+
+**For a completed multi-location job**, the response also includes a `comparison_summary` key:
+
+```json
+{
+  "location_count": 2,
+  "locations": ["..."],
+  "comparison_summary": {
+    "ranked": [
+      {"rank": 1, "name": "Miami", "mean_irradiance_kwh_m2_day": 5.61, "...": "..."},
+      {"rank": 2, "name": "NewYork", "mean_irradiance_kwh_m2_day": 4.33, "...": "..."}
+    ],
+    "best_site": {"name": "Miami", "mean_irradiance_kwh_m2_day": 5.61},
+    "comparison": "Best site: Miami — 5.61 kWh/m²/day ..."
   }
 }
 ```
 
+#### GET /results/{jid}/plot
+
+Returns the daily all-sky irradiance overlay chart as a PNG image. For single-location jobs a single line is drawn; for multi-location jobs all locations are overlaid on the same axes for direct visual comparison.
+
+```bash
+curl http://localhost:5000/results/df89de06-8729-40af-815e-cd3a74a6cc3e/plot --output plot.png
+```
+
+Returns: `image/png` binary data (HTTP 200), or HTTP 404 if the job has no plot stored.
+
 ## Understanding the results
 
-The worker computes the following metrics for every completed job:
+The worker computes the following metrics for every completed job. Each entry in the `locations` list contains:
 
 ### Panel orientation
 - **Recommended tilt** = `|latitude|` degrees — the fixed-tilt angle that maximises annual irradiance for a flat-plate collector.
@@ -464,9 +672,36 @@ SVI = std(G_daily) / mean(G_daily)
 
 Ratio of actual to theoretical clear-sky irradiance. Values close to 1 indicate predominantly clear-sky conditions; values below 0.4 indicate heavy cloud cover.
 
+### Clear-sky utilisation
+
+Ratio of mean all-sky irradiance to mean clear-sky irradiance. Values close to 1 indicate low average cloud impact.
+
+### PV suitability score
+
+A simple 1–5 integer score derived from the mean daily GHI:
+
+| Score | Label | Mean GHI (kWh/m²/day) |
+|---|---|---|
+| 1 | Poor | < 2.0 |
+| 2 | Below average | 2.0 – 3.5 |
+| 3 | Moderate | 3.5 – 5.0 |
+| 4 | Good | 5.0 – 6.0 |
+| 5 | Excellent | > 6.0 |
+
+### Irradiance overlay plot
+
+`GET /results/{jid}/plot` returns a PNG chart of daily all-sky irradiance over the full data window. For multi-location jobs all locations are drawn on the same axes so resource differences are immediately visible.
+
+### Multi-location comparison summary
+
+When a job covers two or more locations the result includes a `comparison_summary` with:
+- `ranked` — all locations sorted best → worst by mean irradiance (ties broken by clearness index then lower temperature de-rating).
+- `best_site` — the top-ranked location with its key metrics.
+- `comparison` — a plain-text narrative summarising the ranking.
+
 ### Sentinel values (-999)
 
-NASA POWER encodes missing or invalid days as `-999`. The worker strips all sentinel values before computing any statistic. The `sentinel_counts` field in the result reports how many missing days were found per parameter.
+NASA POWER encodes missing or invalid days as `-999`. The worker strips all sentinel values before computing any statistic. The `sentinel_counts` field in each location result reports how many missing days were found per parameter.
 
 ## Understanding the data
 

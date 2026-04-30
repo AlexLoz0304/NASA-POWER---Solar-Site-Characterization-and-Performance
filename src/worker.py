@@ -10,23 +10,21 @@ For each job the worker:
      using the same key scheme as FastAPI_api.py.
   3. Filters out NASA POWER missing-data sentinels (-999 / -999.0) before
      computing any statistic — those values must never enter calculations.
-  4. Computes a rich set of solar site characterization statistics:
-        • Mean / median / std / min / max for all relevant parameters.
-        • Best and worst months by average irradiance.
+  4. Computes a rich set of solar site characterization statistics per location:
+        • Monthly mean irradiance breakdown with best/worst month identification.
         • Panel tilt recommendation (= abs(latitude), fixed-tilt rule-of-thumb).
         • Panel azimuth recommendation (south-facing in N hemisphere, north in S).
         • Estimated annual DC energy yield (kWh/kWp) based on performance ratio.
         • Temperature de-rating factor (panel efficiency loss from heat).
-        • Soiling proxy (correlation between precipitation and irradiance drop).
+        • Clear-sky utilisation ratio (actual / theoretical clear-sky irradiance).
         • Solar variability index (std/mean of daily irradiance).
+        • GHI-based PV suitability score.
+        • Per-parameter sentinel counts (missing/invalid NASA POWER days).
   5. If the job payload contained multiple location_ids (POST /jobs body),
-     the worker also writes a cross-location comparison summary that ranks all
-     locations by mean annual irradiance and flags the best site.
-     NOTE: Each location_id maps to a separate job; the comparison is written
-     only when the worker detects sibling jobs sharing the same request group.
-     For simplicity in the current architecture, each job carries its own
-     location's results plus an optional "peer_summary" if peer results are
-     already in db=3.
+     all locations are analysed in a single job. A combined overlay plot is
+     generated covering all locations. When two or more locations are included,
+     a cross-location comparison summary ranks them by mean annual irradiance
+     and flags the best site.
   6. Saves the full result dict to Redis db=3 via save_job_result().
   7. Marks the job FINISHED -- SUCCESS (or FINISHED -- ERROR on failure).
 
@@ -35,19 +33,27 @@ Redis key conventions read here (all in db=0):
   location_id:{uuid}             — maps UUID -> location hash key
 """
 
+import io
+import base64
 import json
 import logging
-import math
 import os
 import statistics
 from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Optional
+
+import matplotlib
+matplotlib.use("Agg")  # headless — no display required inside Docker
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from jobs import (
     JobStatus,
     get_job_by_id,
     q,
     rd,
+    rdb,
     save_job_result,
     start_job,
     update_job_status,
@@ -169,26 +175,6 @@ def _clean(series: list) -> list:
 # ---------------------------------------------------------------------------
 # Solar site characterization helpers
 # ---------------------------------------------------------------------------
-
-def _safe_stats(values: list) -> dict:
-    """
-    Compute descriptive statistics for a cleaned numeric series.
-
-    Returns a dict with mean, median, std, min, max, and count.
-    All values are rounded to 4 decimal places. Returns zeros if empty.
-    """
-    n = len(values)
-    if n == 0:
-        return {"mean": None, "median": None, "std": None, "min": None, "max": None, "count": 0}
-    return {
-        "mean":   round(statistics.mean(values),   4),
-        "median": round(statistics.median(values), 4),
-        "std":    round(statistics.stdev(values),  4) if n > 1 else 0.0,
-        "min":    round(min(values), 4),
-        "max":    round(max(values), 4),
-        "count":  n,
-    }
-
 
 def _monthly_means(series: list, start_date: str) -> dict:
     """
@@ -413,13 +399,7 @@ def _analyze_location(record: dict) -> dict:
 
     # Irradiance series (primary metric for solar characterisation)
     irr_series   = series["ALLSKY_SFC_SW_DWN"]
-    clr_series   = series["CLRSKY_SFC_SW_DWN"]
-    kt_series    = series["ALLSKY_KT"]
-    temp_series  = series["T2M"]
     n_days       = len(irr_series)
-
-    # --- Per-parameter descriptive stats ---
-    param_stats = {p: _safe_stats(series[p]) for p in NASA_PARAMETERS}
 
     # --- Monthly mean irradiance breakdown ---
     monthly_irr = _monthly_means(record.get("ALLSKY_SFC_SW_DWN", []), record.get("start_date", ""))
@@ -428,20 +408,26 @@ def _analyze_location(record: dict) -> dict:
     # --- Panel orientation recommendation ---
     orientation = _panel_orientation(lat)
 
+    # --- Key scalar means computed directly from cleaned series ---
+    def _smean(s):  return round(statistics.mean(s), 4) if s else None
+    def _smax(s):   return round(max(s), 4)             if s else None
+    def _smin(s):   return round(min(s), 4)             if s else None
+
+    mean_irr  = _smean(series["ALLSKY_SFC_SW_DWN"]) or 0.0
+    mean_temp = _smean(series["T2M"]) or STC_TEMP
+
     # --- Energy yield estimate ---
-    mean_irr  = param_stats["ALLSKY_SFC_SW_DWN"]["mean"] or 0.0
-    mean_temp = param_stats["T2M"]["mean"] or STC_TEMP
     yield_est = _energy_yield(mean_irr, mean_temp, n_days)
 
     # --- Solar variability index ---
     svi = _solar_variability_index(record.get("ALLSKY_SFC_SW_DWN", []))
 
     # --- Clearness index (mean ALLSKY_KT): 0=fully overcast, 1=perfectly clear ---
-    mean_kt = param_stats["ALLSKY_KT"]["mean"]
+    mean_kt = _smean(series["ALLSKY_KT"])
 
     # --- Clear-sky utilisation ratio ---
     # How much of the theoretical clear-sky irradiance is actually available.
-    mean_clr = param_stats["CLRSKY_SFC_SW_DWN"]["mean"] or 0.0
+    mean_clr = _smean(series["CLRSKY_SFC_SW_DWN"]) or 0.0
     clr_utilisation = round(mean_irr / mean_clr, 4) if mean_clr > 0 else None
 
     result = {
@@ -456,8 +442,6 @@ def _analyze_location(record: dict) -> dict:
         },
         # Recommended panel mounting geometry
         "panel_orientation": orientation,
-        # Descriptive stats for every NASA POWER parameter
-        "parameter_stats": param_stats,
         # Irradiance-focused breakdown
         "irradiance": {
             "mean_kwh_m2_day":        mean_irr,
@@ -476,32 +460,25 @@ def _analyze_location(record: dict) -> dict:
         "energy_yield": yield_est,
         # Temperature context (affects panel efficiency)
         "temperature": {
-            "mean_c":       param_stats["T2M"]["mean"],
-            "max_c":        param_stats["T2M_MAX"]["max"],
-            "min_c":        param_stats["T2M_MIN"]["min"],
-            "stats_T2M":    param_stats["T2M"],
-            "stats_T2M_MAX":param_stats["T2M_MAX"],
-            "stats_T2M_MIN":param_stats["T2M_MIN"],
+            "mean_c": _smean(series["T2M"]),
+            "max_c":  _smax(series["T2M_MAX"]),
+            "min_c":  _smin(series["T2M_MIN"]),
         },
         # Wind context (affects cooling and structural loads)
         "wind": {
-            "mean_ws10m_m_s": param_stats["WS10M"]["mean"],
-            "stats":          param_stats["WS10M"],
+            "mean_ws10m_m_s": _smean(series["WS10M"]),
         },
         # Humidity context (affects soiling and corrosion risk)
         "humidity": {
-            "mean_rh2m_pct": param_stats["RH2M"]["mean"],
-            "stats":         param_stats["RH2M"],
+            "mean_rh2m_pct": _smean(series["RH2M"]),
         },
         # Cloud cover
         "cloud_cover": {
-            "mean_cloud_amt_pct": param_stats["CLOUD_AMT"]["mean"],
-            "stats":              param_stats["CLOUD_AMT"],
+            "mean_cloud_amt_pct": _smean(series["CLOUD_AMT"]),
         },
         # Precipitation (proxy for self-cleaning rain and cloud-cover correlation)
         "precipitation": {
-            "mean_mm_day": param_stats["PRECTOTCORR"]["mean"],
-            "stats":       param_stats["PRECTOTCORR"],
+            "mean_mm_day": _smean(series["PRECTOTCORR"]),
         },
         # Days with missing NASA POWER data (sentinel = -999)
         "sentinel_counts": sentinel_counts,
@@ -586,6 +563,80 @@ def _rank_locations(analyses: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Irradiance plot helper
+# ---------------------------------------------------------------------------
+
+PLOT_COLORS = [
+    "steelblue", "tomato", "seagreen", "darkorange", "mediumpurple",
+    "saddlebrown", "deeppink", "teal", "gold", "slategray",
+]
+
+
+def _build_irradiance_plot(loc_records: list) -> bytes:
+    """
+    Generate a combined PNG plot of daily irradiance for one or more locations.
+
+    All locations are drawn on a single axes so they can be compared directly.
+    X-axis — calendar dates derived from each location's start_date.
+    Y-axis — all-sky surface shortwave downward irradiance (kWh/m²/day).
+    Sentinel values (-999) are replaced with NaN (gap in the line).
+
+    Args:
+        loc_records: list of dicts, each returned by _read_location_by_id().
+
+    Returns:
+        Raw PNG bytes.
+    """
+    fig, ax = plt.subplots(figsize=(14, 5))
+    use_dates = False
+
+    for i, rec in enumerate(loc_records):
+        raw_series = rec.get("ALLSKY_SFC_SW_DWN", [])
+        start_str  = rec.get("start_date", "")
+        label      = rec.get("name") or f"({rec.get('lat')}, {rec.get('lon')})"
+        color      = PLOT_COLORS[i % len(PLOT_COLORS)]
+
+        values = [
+            float("nan") if (v is None or v <= SENTINEL + 0.5) else float(v)
+            for v in raw_series
+        ]
+
+        try:
+            start_dt = datetime.strptime(start_str, "%Y%m%d")
+            dates = [start_dt + timedelta(days=j) for j in range(len(values))]
+            ax.plot(dates, values, linewidth=0.8, color=color, label=label, alpha=0.85)
+            use_dates = True
+        except (ValueError, TypeError):
+            ax.plot(values, linewidth=0.8, color=color, label=label, alpha=0.85)
+
+    if use_dates:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        fig.autofmt_xdate(rotation=45)
+    else:
+        ax.set_xlabel("Day index")
+
+    title = (
+        "Daily All-Sky Irradiance — "
+        + ", ".join(
+            r.get("name") or f"({r.get('lat')}, {r.get('lon')})"
+            for r in loc_records
+        )
+    )
+    ax.set_ylabel("Irradiance (kWh/m²/day)")
+    ax.set_title(title, fontsize=10)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------------------------------------------------------------------------
 # Job processor
 # ---------------------------------------------------------------------------
 
@@ -596,10 +647,10 @@ def do_work(jid: str | None = None) -> None:
 
     Steps:
       1. Mark the job RUNNING.
-      2. Read the location record from Redis db=0.
-      3. Analyse the time-series data (all sentinel values excluded).
-      4. Save the result dict to Redis db=3 via save_job_result().
-      5. Mark the job FINISHED -- SUCCESS or FINISHED -- ERROR.
+      2. For each location_id in job.location_ids, read the location record
+         from Redis db=0, analyse it, and embed its irradiance plot.
+      3. Save the combined result list to Redis db=3 via save_job_result().
+      4. Mark the job FINISHED -- SUCCESS or FINISHED -- ERROR.
     """
     logger.info(f"[JOB START] {jid}")
     if jid is None:
@@ -615,30 +666,52 @@ def do_work(jid: str | None = None) -> None:
     try:
         # --- Step 2: Retrieve the job metadata from db=2 ---
         job = get_job_by_id(jid)
-        
-        # --- Step 2a: Read the location record using the location_id from the job ---
-        loc_record = _read_location_by_id(job.location_id)
-        if loc_record is None:
-            raise ValueError(f"Could not find location record for location_id={job.location_id}")
 
-        logger.info(f"[JOB RUNNING] {jid} — analysing {loc_record.get('name', '(no name)')} "
-                    f"| {len(loc_record.get('ALLSKY_SFC_SW_DWN', []))} days")
+        location_results = []
+        all_loc_records  = []
+        for loc_id in job.location_ids:
+            loc_record = _read_location_by_id(loc_id)
+            if loc_record is None:
+                raise ValueError(f"Could not find location record for location_id={loc_id}")
 
-        # --- Step 3: Run solar site characterization analysis ---
-        analysis = _analyze_location(loc_record)
+            logger.info(f"[JOB RUNNING] {jid} — analysing {loc_record.get('name', '(no name)')} "
+                        f"| {len(loc_record.get('ALLSKY_SFC_SW_DWN', []))} days")
 
-        # --- Step 4: Save result to Redis db=3 ---
-        save_job_result(jid, analysis)
+            # Use job-level date overrides if provided
+            if job.start_date:
+                loc_record["start_date"] = job.start_date
+            if job.end_date:
+                loc_record["end_date"] = job.end_date
 
-        # --- Step 5: Mark SUCCESS ---
+            analysis = _analyze_location(loc_record)
+            location_results.append(analysis)
+            all_loc_records.append(loc_record)
+
+        # Build one combined plot covering all locations
+        try:
+            png_bytes = _build_irradiance_plot(all_loc_records)
+            plot_b64  = base64.b64encode(png_bytes).decode("utf-8")
+            logger.info(f"[PLOT EMBEDDED] {jid} — {len(png_bytes)} bytes ({len(all_loc_records)} location(s))")
+        except Exception as plot_err:
+            logger.warning(f"[PLOT WARN] {jid}: plot generation failed — {plot_err}")
+            plot_b64 = None
+
+        # --- Step 3: Save combined result ---
+        combined = {
+            "location_count":         len(location_results),
+            "locations":              location_results,
+            "irradiance_plot_base64": plot_b64,
+        }
+
+        # Add cross-location comparison summary when ≥2 locations
+        if len(location_results) >= 2:
+            combined["comparison_summary"] = _rank_locations(location_results)
+
+        save_job_result(jid, combined)
+
+        # --- Step 4: Mark SUCCESS ---
         update_job_status(jid, JobStatus.SUCCESS)
-        mean_irr = analysis["irradiance"]["mean_kwh_m2_day"]
-        yield_est = analysis["energy_yield"]["estimated_annual_yield_kwh_per_kwp"]
-        logger.info(
-            f"[JOB DONE] {jid} — SUCCESS | "
-            f"mean irradiance={mean_irr} kWh/m²/day | "
-            f"est. yield={yield_est} kWh/kWp/yr"
-        )
+        logger.info(f"[JOB DONE] {jid} — SUCCESS | {len(location_results)} location(s) analysed")
 
     except Exception as e:
         logger.error(f"[JOB ERROR] {jid}: {e}", exc_info=True)

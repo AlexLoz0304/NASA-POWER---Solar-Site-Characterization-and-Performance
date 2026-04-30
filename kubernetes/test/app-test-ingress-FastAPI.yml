@@ -1,0 +1,21 @@
+---
+kind: Ingress
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: nasa-power-test-fastapi-ingress
+  namespace: alozano0304
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: "alozano0304-nasa-power-test.coe332.tacc.cloud"
+      http:
+        paths:
+          - pathType: Prefix
+            path: "/"
+            backend:
+              service:
+                name: nasa-power-test-fastapi-nodeport-service
+                port:
+                  number: 8000

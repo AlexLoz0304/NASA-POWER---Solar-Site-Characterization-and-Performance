@@ -215,8 +215,7 @@ class TestJobSubmissionAndPolling:
         return Job(
             jid="job-uuid-5678",
             status=status_map.get(status, JobStatus.QUEUED),
-            location_id="loc-uuid-1234",
-            lat=34.0, lon=-118.0,
+            location_ids=["loc-uuid-1234"],
             start_date="20250101", end_date="20260101",
         )
 
@@ -227,7 +226,8 @@ class TestJobSubmissionAndPolling:
             mock_rd.get = Mock(return_value=b"location:34.0:-118.0:loc-uuid-1234")
             r = client.post("/jobs", json={"location_ids": ["loc-uuid-1234"]})
         assert r.status_code == 200
-        assert isinstance(r.json(), list)
+        assert isinstance(r.json(), dict)
+        assert "jid" in r.json()
 
     def test_post_jobs_job_is_queued(self):
         with patch('FastAPI_api.rd') as mock_rd, \
@@ -235,7 +235,7 @@ class TestJobSubmissionAndPolling:
              patch('FastAPI_api._read_location_hash', return_value=self._FAKE_LOC):
             mock_rd.get = Mock(return_value=b"location:34.0:-118.0:loc-uuid-1234")
             r = client.post("/jobs", json={"location_ids": ["loc-uuid-1234"]})
-        job = r.json()[0]
+        job = r.json()
         assert job["status"] == "QUEUED"
         assert job["jid"] == "job-uuid-5678"
 

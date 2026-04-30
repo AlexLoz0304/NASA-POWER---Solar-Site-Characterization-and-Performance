@@ -79,25 +79,21 @@ class Job(BaseModel):
     Represents a background NASA POWER data-fetch task.
 
     Fields:
-        jid        — Unique job identifier (UUID string).
-        status     — Current lifecycle state (see JobStatus enum).
-        location_id — UUID of the location to analyze (stored as location_id:{uuid} in Redis db=0).
-        lat        — Latitude  in decimal degrees (cached from location record).
-        lon        — Longitude in decimal degrees (cached from location record).
-        start_date — NASA POWER date range start (YYYYMMDD string).
-        end_date   — NASA POWER date range end   (YYYYMMDD string).
-        start_time — UTC wall-clock time when the worker began processing.
-        end_time   — UTC wall-clock time when the worker finished.
+        jid          — Unique job identifier (UUID string).
+        status       — Current lifecycle state (see JobStatus enum).
+        location_ids — List of location UUIDs to analyze in this job.
+        start_date   — NASA POWER date range start override (YYYYMMDD string).
+        end_date     — NASA POWER date range end   override (YYYYMMDD string).
+        start_time   — UTC wall-clock time when the worker began processing.
+        end_time     — UTC wall-clock time when the worker finished.
     """
-    jid:        str
-    status:     JobStatus
-    location_id: str  # UUID identifying the specific location to analyze
-    lat:        Optional[float] = None
-    lon:        Optional[float] = None
-    start_date: Optional[str]  = None
-    end_date:   Optional[str]  = None
-    start_time: Optional[datetime] = None  # Set by start_job() when worker picks it up
-    end_time:   Optional[datetime] = None  # Set by update_job_status() on completion
+    jid:          str
+    status:       JobStatus
+    location_ids: typing.List[str]  # One or more location UUIDs to analyze
+    start_date:   Optional[str]  = None
+    end_date:     Optional[str]  = None
+    start_time:   Optional[datetime] = None  # Set by start_job() when worker picks it up
+    end_time:     Optional[datetime] = None  # Set by update_job_status() on completion
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +113,7 @@ def _generate_jid() -> str:
 
 
 def _instantiate_job(jid: str, status: JobStatus,
-                     location_id: str,
-                     lat: Optional[float], lon: Optional[float],
+                     location_ids: typing.List[str],
                      start_date: Optional[str], end_date: Optional[str]) -> Job:
     """
     Construct a Job Pydantic model from the provided parameters.
@@ -127,13 +122,11 @@ def _instantiate_job(jid: str, status: JobStatus,
     Use _save_job() to persist the returned object.
 
     Args:
-        jid        (str):            Job UUID.
-        status     (JobStatus):      Initial status (typically QUEUED).
-        location_id (str):           UUID of the location to analyze.
-        lat        (float):          Target latitude (cached from location).
-        lon        (float):          Target longitude (cached from location).
-        start_date (str):            NASA POWER start date (YYYYMMDD).
-        end_date   (str):            NASA POWER end   date (YYYYMMDD).
+        jid          (str):            Job UUID.
+        status       (JobStatus):      Initial status (typically QUEUED).
+        location_ids (List[str]):      UUIDs of the locations to analyze.
+        start_date   (str):            NASA POWER start date override (YYYYMMDD).
+        end_date     (str):            NASA POWER end   date override (YYYYMMDD).
 
     Returns:
         Job: A fully populated (but not yet persisted) Job instance.
@@ -141,15 +134,13 @@ def _instantiate_job(jid: str, status: JobStatus,
     job = Job(
         jid=jid,
         status=status,
-        location_id=location_id,
-        lat=lat,
-        lon=lon,
+        location_ids=location_ids,
         start_date=start_date,
         end_date=end_date,
     )
     logger.debug(
-        f"Instantiated point job {jid}: "
-        f"location_id={location_id}  ({lat}, {lon})  "
+        f"Instantiated job {jid}: "
+        f"location_ids={location_ids}  "
         f"[{start_date} -> {end_date}]  status={status}"
     )
     return job
@@ -230,23 +221,19 @@ def get_job_by_id(jid: str) -> Job:
         raise
 
 
-def add_job(location_id: str,
-            lat: Optional[float] = None,
-            lon: Optional[float] = None,
+def add_job(location_ids: typing.List[str],
             start_date: Optional[str] = None,
             end_date:   Optional[str] = None) -> Job:
     """
-    Create a new point job, persist it in Redis db=2, and enqueue it for the worker.
+    Create a new job for one or more locations, persist it in Redis db=2, and enqueue it.
 
     Called by POST /jobs.
     The returned Job will have status=QUEUED and no start/end timestamps yet.
 
     Args:
-        location_id (str):         UUID of the location to analyze.
-        lat        (float):        Target latitude (cached from location).
-        lon        (float):        Target longitude (cached from location).
-        start_date (str):          NASA POWER start date (YYYYMMDD).
-        end_date   (str):          NASA POWER end   date (YYYYMMDD).
+        location_ids (List[str]): UUIDs of the locations to analyze.
+        start_date   (str):       NASA POWER start date override (YYYYMMDD).
+        end_date     (str):       NASA POWER end   date override (YYYYMMDD).
 
     Returns:
         Job: The newly created Job object with status QUEUED.
@@ -255,9 +242,7 @@ def add_job(location_id: str,
     job = _instantiate_job(
         jid=jid,
         status=JobStatus.QUEUED,
-        location_id=location_id,
-        lat=lat,
-        lon=lon,
+        location_ids=location_ids,
         start_date=start_date,
         end_date=end_date,
     )
@@ -265,8 +250,8 @@ def add_job(location_id: str,
     _queue_job(jid)       # Push jid onto HotQueue so worker picks it up
 
     logger.info(
-        f"Queued point job {jid}: "
-        f"location_id={location_id}  ({lat}, {lon})  "
+        f"Queued job {jid}: "
+        f"location_ids={location_ids}  "
         f"[{start_date} -> {end_date}]"
     )
     return job

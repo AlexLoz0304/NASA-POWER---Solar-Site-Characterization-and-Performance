@@ -400,30 +400,36 @@ class TestJobEndpoints(unittest.TestCase):
         r = requests.post(f"{BASE_URL}/locations", json=TEST_LOCATIONS[0])
         cls.loc_id = r.json()["id"]
 
-    def test_post_jobs_returns_list(self):
-        """POST /jobs must return a JSON list."""
+    def test_post_jobs_returns_single_job(self):
+        """POST /jobs must return a single Job JSON object (dict)."""
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [self.loc_id]})
         self.assertEqual(r.status_code, 200)
-        self.assertIsInstance(r.json(), list)
+        self.assertIsInstance(r.json(), dict)
+        self.assertIn("jid", r.json())
 
-    def test_post_jobs_one_job_per_location(self):
-        """POST /jobs with N location_ids must create exactly N jobs."""
+    def test_post_jobs_single_job_for_multiple_locations(self):
+        """POST /jobs with N location_ids must create exactly one job covering all locations."""
         # Create a second location
         r2 = requests.post(f"{BASE_URL}/locations", json=TEST_LOCATIONS[1])
         loc_id2 = r2.json()["id"]
 
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [self.loc_id, loc_id2]})
-        self.assertEqual(len(r.json()), 2)
+        self.assertEqual(r.status_code, 200)
+        job = r.json()
+        self.assertIsInstance(job, dict)
+        self.assertIn("jid", job)
+        self.assertIn(self.loc_id, job["location_ids"])
+        self.assertIn(loc_id2, job["location_ids"])
 
     def test_post_jobs_job_shape(self):
-        """Newly created jobs must have status QUEUED and all required fields."""
+        """Newly created job must have status QUEUED and all required fields."""
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [self.loc_id]})
-        job = r.json()[0]
+        job = r.json()
         self.assertEqual(job["status"], "QUEUED")
-        for field in ("jid", "status", "lat", "lon", "start_date", "end_date"):
+        for field in ("jid", "status", "location_ids", "start_date", "end_date"):
             self.assertIn(field, job)
 
     def test_post_jobs_rejects_empty_location_ids(self):
@@ -451,7 +457,7 @@ class TestJobEndpoints(unittest.TestCase):
         """GET /jobs/{jid} must return 200 with the job whose jid matches."""
         r = requests.post(f"{BASE_URL}/jobs",
                           json={"location_ids": [self.loc_id]})
-        jid = r.json()[0]["jid"]
+        jid = r.json()["jid"]
         r2 = requests.get(f"{BASE_URL}/jobs/{jid}")
         self.assertEqual(r2.status_code, 200)
         self.assertEqual(r2.json()["jid"], jid)
@@ -471,7 +477,7 @@ class TestResultsEndpoint(unittest.TestCase):
         r = requests.post(f"{BASE_URL}/locations", json=TEST_LOCATIONS[0])
         cls.loc_id = r.json()["id"]
         r = requests.post(f"{BASE_URL}/jobs", json={"location_ids": [cls.loc_id]})
-        cls.jid = r.json()[0]["jid"]
+        cls.jid = r.json()["jid"]
         cls.result = cls._poll_until_done(cls.jid)
 
     @classmethod
@@ -493,42 +499,40 @@ class TestResultsEndpoint(unittest.TestCase):
     def test_get_results_pending_has_job_status(self):
         """GET /results/{jid} must return 200 with a job_status field immediately after submission."""
         r_new = requests.post(f"{BASE_URL}/jobs", json={"location_ids": [self.loc_id]})
-        jid2 = r_new.json()[0]["jid"]
+        jid2 = r_new.json()["jid"]
         r = requests.get(f"{BASE_URL}/results/{jid2}")
         self.assertEqual(r.status_code, 200)
         self.assertIn("job_status", r.json())
 
     def test_completed_job_has_results_and_success_status(self):
-        """After job SUCCESS, response must include job_status with SUCCESS and a non-null results dict."""
+        """After job SUCCESS, response must include job_status with SUCCESS and a locations list."""
         self.assertIn("SUCCESS", self.result["job_status"])
-        self.assertIn("results", self.result)
-        self.assertIsNotNone(self.result["results"])
+        self.assertIn("locations", self.result)
+        self.assertGreater(len(self.result["locations"]), 0)
 
     def test_completed_job_panel_orientation(self):
         """Results must include panel_orientation with correct tilt (=|lat|), azimuth, and facing."""
-        ori = self.result["results"]["panel_orientation"]
+        loc_result = self.result["locations"][0]
+        ori = loc_result["panel_orientation"]
         for key in ("recommended_tilt_deg", "recommended_azimuth_deg", "facing"):
             self.assertIn(key, ori)
-        lat = abs(self.result["results"]["location"]["lat"])
+        lat = abs(loc_result["location"]["lat"])
         self.assertAlmostEqual(ori["recommended_tilt_deg"], lat, places=1)
 
     def test_completed_job_energy_and_irradiance(self):
         """Results must include energy_yield with positive yield and full irradiance section."""
-        yld = self.result["results"]["energy_yield"]
+        loc_result = self.result["locations"][0]
+        yld = loc_result["energy_yield"]
         self.assertIn("estimated_annual_yield_kwh_per_kwp", yld)
         self.assertGreater(yld["estimated_annual_yield_kwh_per_kwp"], 0)
-        irr = self.result["results"]["irradiance"]
+        irr = loc_result["irradiance"]
         for key in ("mean_kwh_m2_day", "monthly_means", "best_worst_months",
                     "variability_index", "clearness_index_mean"):
             self.assertIn(key, irr)
 
-    def test_completed_job_parameter_stats_and_sentinel_counts(self):
-        """Results must include per-parameter stats and sentinel_counts for ALLSKY_SFC_SW_DWN."""
-        stats = self.result["results"]["parameter_stats"]
-        self.assertIn("ALLSKY_SFC_SW_DWN", stats)
-        for key in ("mean", "median", "std", "min", "max", "count"):
-            self.assertIn(key, stats["ALLSKY_SFC_SW_DWN"])
-        sc = self.result["results"]["sentinel_counts"]
+    def test_completed_job_sentinel_counts(self):
+        """Results must include sentinel_counts for ALLSKY_SFC_SW_DWN."""
+        sc = self.result["locations"][0]["sentinel_counts"]
         self.assertIn("ALLSKY_SFC_SW_DWN", sc)
         self.assertIsInstance(sc["ALLSKY_SFC_SW_DWN"], int)
 

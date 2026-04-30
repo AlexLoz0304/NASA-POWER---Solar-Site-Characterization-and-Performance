@@ -1,0 +1,13 @@
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: nasa-power-prod-fastapi-nodeport-service
+  namespace: alozano0304
+spec:
+  type: NodePort
+  selector:
+    app: nasa-power-prod-fastapi
+  ports:
+    - port: 8000
+      targetPort: 8000

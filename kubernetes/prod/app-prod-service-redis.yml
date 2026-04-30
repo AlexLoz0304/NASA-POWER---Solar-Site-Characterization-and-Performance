@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nasa-power-prod-redis-service
+  namespace: alozano0304
+spec:
+  type: ClusterIP
+  selector:
+    app: nasa-power-prod-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379

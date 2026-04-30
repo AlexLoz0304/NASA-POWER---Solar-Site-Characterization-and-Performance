@@ -3,8 +3,10 @@ NASA POWER — Point-Redis key conventions (db=0 for locations):
   location:{lat:.1f}:{lon:.1f}                   — Redis set: stores all location keys at this grid cell (enables multiple locations per cell).
   location:{lat:.1f}:{lon:.1f}:{loc_id}          — Hash storing all parameter series and metadata for a specific location.
   location_name:{name_lower}                    — Redis set: maps friendly name (lower-cased) → location keys (supports multiple locations per name).
-  location_id:{uuid}                             — Maps UUID → full location key with loc_id.sed FastAPI
-===================================
+  location_id:{uuid}                             — Maps UUID → full location key with loc_id.
+
+FastAPI — Solar Site Characterization API
+=========================================
 
 All interactions are point-level: a location is fetched from the NASA POWER
 daily point endpoint, stored in Redis, and can then be referenced by jobs.
@@ -20,27 +22,31 @@ Locations:
   DELETE /locations/{loc_id}        — Delete a stored location and all its Redis mappings.
 
 Jobs:
-  POST   /jobs                      — Queue point jobs for one or more stored location UUIDs.
+  POST   /jobs                      — Queue one job covering all supplied location UUIDs. Returns a single Job.
   GET    /jobs                      — List all queued/running/finished jobs.
   GET    /jobs/{jid}                — Get a single job by UUID.
-  GET    /results/{jid}             — Get the full solar site characterization result of a finished job.
+  GET    /results/{jid}             — Get the combined solar site characterization result for a finished job.
+  GET    /results/{jid}/plot        — Return the daily irradiance overlay plot (PNG) for a finished job.
 
 Meta:
   GET    /help                      — Return a structured JSON reference of every endpoint.
+  GET    /health                    — Return application health status and Redis connectivity.
 
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, root_validator, field_validator, model_validator
+from fastapi.responses import Response
+from pydantic import BaseModel, Field, field_validator, model_validator
 from jobs import Job, add_job, get_job_by_id, jdb, rd, get_job_result
 import json
 import redis
 import os
 import logging
 import requests as http_requests
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 import uuid
+import base64
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ---------------------------------------------------------------------------
@@ -63,9 +69,9 @@ app = FastAPI()
 # These are evaluated once at module import; clients may override per-request
 # by passing explicit start_date / end_date in the request body.
 # ---------------------------------------------------------------------------
-from datetime import timedelta as _td
-_end_date  = datetime.utcnow().date() - _td(days=10)   # 10 days ago
-_start_date = _end_date - _td(days=365)                 # 1 year before that
+from datetime import timedelta as _td, timezone as _tz
+_end_date  = datetime.now(_tz.utc).date() - _td(days=10)   # 10 days ago
+_start_date = _end_date - _td(days=365)                     # 1 year before that
 
 DEFAULT_END   = _end_date.strftime("%Y%m%d")    # e.g. "20260415"
 DEFAULT_START = _start_date.strftime("%Y%m%d")  # e.g. "20250415"
@@ -130,7 +136,7 @@ class LocationCreate(BaseModel):
                 parsed = datetime.strptime(v, '%Y%m%d').date()
             except ValueError:
                 raise ValueError('date must be in YYYYMMDD format (e.g. 20250101)')
-            if parsed > datetime.utcnow().date():
+            if parsed > datetime.now(timezone.utc).date():
                 raise ValueError('date cannot be in the future')
         return v
 
@@ -168,19 +174,18 @@ class Location(BaseModel):
 
 
 class JobRequest(BaseModel):
-    location_ids: List[str] = Field(..., min_items=1, description="One or more stored location UUIDs")
+    location_ids: List[str] = Field(..., min_length=1, description="One or more stored location UUIDs")
     # If omitted the job will use the stored location's start/end dates
     # (the values saved when the location was created). This lets callers
     # queue refresh jobs without re-specifying the original range.
     start_date: Optional[str] = None
     end_date: Optional[str] = None
 
-    @root_validator(skip_on_failure=True)
-    def require_location_ids(cls, values):
-        locs = values.get('location_ids')
-        if not locs:
+    @model_validator(mode='after')
+    def require_location_ids(self) -> 'JobRequest':
+        if not self.location_ids:
             raise ValueError('location_ids must contain at least one id')
-        return values
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -453,11 +458,13 @@ def list_locations() -> dict:
             rec = _read_location_hash(loc_key)
             if rec:
                 results.append({
-                    "id": rec.get("id"),
-                    "key": rec.get("key"),
-                    "lat": rec.get("lat"),
-                    "lon": rec.get("lon"),
-                    "name": rec.get("name"),
+                    "id":         rec.get("id"),
+                    "key":        rec.get("key"),
+                    "lat":        rec.get("lat"),
+                    "lon":        rec.get("lon"),
+                    "name":       rec.get("name"),
+                    "start_date": rec.get("start_date"),
+                    "end_date":   rec.get("end_date"),
                 })
             else:
                 results.append({"id": loc_id, "key": loc_key, "lat": None, "lon": None, "name": None})
@@ -597,6 +604,8 @@ def get_location_data(lat: float, lon: float) -> dict:
         }
         
         if len(locations) == 1:
+            response_data["id"]       = locations[0].get("id")
+            response_data["name"]     = locations[0].get("name")
             response_data["location"] = locations[0]
         else:
             response_data["locations"] = locations
@@ -617,25 +626,23 @@ def get_location_data(lat: float, lon: float) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.post("/jobs", status_code=200)
-def post_job(req: JobRequest) -> List[Job]:
-    """Queue background point jobs for one or more stored locations.
+def post_job(req: JobRequest) -> Job:
+    """Queue a single background job for one or more stored locations.
 
     Accepts a list of location UUIDs (previously created via POST /locations).
-    For each location, a point job is enqueued for the worker to process.
-    If start_date / end_date are omitted, the dates stored with the location
-    are used as-is.
+    A single job is created that will analyse all supplied locations and return
+    a combined result.  If start_date / end_date are omitted, each location's
+    stored dates are used.
 
     Args:
         req (JobRequest): { location_ids, start_date?, end_date? }
 
     Returns:
-        List[Job]: One Job object per location_id, each in QUEUED state.
-                   Poll GET /jobs/{jid} for status updates.
-                   Note: the current worker is a stub — it marks jobs SUCCESS
-                   after 5 s but does not persist result data to Redis.
+        Job: A single Job object in QUEUED state covering all location_ids.
+             Poll GET /jobs/{jid} for status; GET /results/{jid} for results.
     """
     try:
-        jobs = []
+        # Validate every location_id exists before queuing anything
         for loc_id in req.location_ids:
             mapped = rd.get(f"{LOCATION_ID_PREFIX}{loc_id}")
             if not mapped:
@@ -644,24 +651,14 @@ def post_job(req: JobRequest) -> List[Job]:
             rec = _read_location_hash(key)
             if not rec:
                 raise HTTPException(status_code=404, detail=f"Location id '{loc_id}' resolved to '{key}' but record missing")
-            lat = rec["lat"]
-            lon = rec["lon"]
-            # Determine dates for the job: prefer explicit request dates;
-            # otherwise fall back to the stored location start/end (or
-            # defaults if the stored record lacks them).
-            job_start = req.start_date or rec.get("start_date") or DEFAULT_START
-            job_end = req.end_date or rec.get("end_date") or DEFAULT_END
 
-            job = add_job(
-                location_id=loc_id,
-                lat=lat,
-                lon=lon,
-                start_date=job_start,
-                end_date=job_end,
-            )
-            logger.info(f"POST /jobs: Queued point job {job.jid} for id={loc_id} ({lat}, {lon})")
-            jobs.append(job)
-        return jobs
+        job = add_job(
+            location_ids=req.location_ids,
+            start_date=req.start_date,
+            end_date=req.end_date,
+        )
+        logger.info(f"POST /jobs: Queued job {job.jid} for {len(req.location_ids)} location(s): {req.location_ids}")
+        return job
 
     except redis.ConnectionError as e:
         raise HTTPException(status_code=500, detail=f"Redis connection error: {e}")
@@ -851,7 +848,7 @@ def get_help() -> dict:
                 "path": "/jobs",
                 "description": (
                     "Queue solar site characterization jobs for one or more stored location UUIDs. "
-                    "One RQ job is created per location_id. Poll GET /results/{jid} for the result."
+                    "One job is created for all location_ids. Poll GET /results/{jid} for the combined result."
                 ),
                 "parameters": [
                     {"name": "location_ids", "in": "body", "type": "list[string]", "required": True,  "description": "One or more location UUIDs (non-empty)"},
@@ -884,17 +881,32 @@ def get_help() -> dict:
                 "method": "GET",
                 "path": "/results/{jid}",
                 "description": (
-                    "Retrieve the full solar characterization result for a finished job. "
+                    "Retrieve the combined solar characterization result for a finished job. "
                     "Response varies by job state: queued → status message; "
                     "running → status + start_time; "
                     "error → status + timestamps; "
-                    "success → full result dict (panel orientation, energy yield, "
-                    "irradiance breakdown, parameter stats, sentinel counts, etc.)."
+                    "success → combined result with location_count, locations list "
+                    "(panel orientation, energy yield, irradiance breakdown, "
+                    "sentinel counts, climate sections), and optional "
+                    "comparison_summary when ≥2 locations were analysed."
                 ),
                 "parameters": [
                     {"name": "jid", "in": "path", "type": "string (UUID)", "required": True, "description": "Job UUID"},
                 ],
                 "example": "curl http://localhost:5000/results/df89de06-8729-40af-815e-cd3a74a6cc3e",
+            },
+            {
+                "method": "GET",
+                "path": "/results/{jid}/plot",
+                "description": (
+                    "Return the daily all-sky irradiance overlay plot as a PNG image for a finished job. "
+                    "Single-location jobs produce a single line; multi-location jobs overlay all locations "
+                    "on one chart for direct comparison. Returns 404 if the job has no plot stored."
+                ),
+                "parameters": [
+                    {"name": "jid", "in": "path", "type": "string (UUID)", "required": True, "description": "Job UUID"},
+                ],
+                "example": "curl http://localhost:5000/results/df89de06-8729-40af-815e-cd3a74a6cc3e/plot --output plot.png",
             },
         ],
     }
@@ -902,16 +914,24 @@ def get_help() -> dict:
 
 @app.get("/results/{jid}")
 def get_results(jid: str) -> dict:
-    """Retrieve the solar site characterization result of a finished job.
+    """Retrieve the combined solar site characterization result for a finished job.
 
     Response varies by job state:
         QUEUED              — Worker hasn't picked it up yet.
         RUNNING             — Job is in progress; check back shortly.
         FINISHED -- ERROR   — Job failed; timestamps returned.
-        FINISHED -- SUCCESS — Full solar characterization result dict, including
-                              panel orientation recommendation, energy yield
-                              estimate, per-parameter statistics, monthly
-                              irradiance breakdown, and variability index.
+        FINISHED -- SUCCESS — Combined result dict with:
+                                • location_count  — number of locations analysed.
+                                • locations       — list of per-location result dicts, each
+                                                    containing panel_orientation, energy_yield,
+                                                    irradiance, temperature, wind, humidity,
+                                                    cloud_cover, precipitation, sentinel_counts,
+                                                    peak_sun_hours, pv_suitability.
+                                • comparison_summary — present when ≥2 locations were analysed;
+                                                    includes ranked list, best_site, and
+                                                    plain-text comparison narrative.
+                              The irradiance overlay PNG is available separately via
+                              GET /results/{jid}/plot.
 
     Args:
         jid (str): UUID of the job.
@@ -963,14 +983,23 @@ def get_results(jid: str) -> dict:
                     "job_status": job.status,
                     "message":    "Job completed but results could not be retrieved.",
                 }
-            return {
-                "status":     "success",
-                "job_id":     jid,
-                "job_status": job.status,
-                "start_time": str(job.start_time),
-                "end_time":   str(job.end_time),
-                "results":    results,
+            # Strip plot blobs from each location — exposed via GET /results/{jid}/plot?idx=N
+            locations_clean = [
+                {k: v for k, v in loc.items() if k != "irradiance_plot_base64"}
+                for loc in results.get("locations", [])
+            ]
+            response = {
+                "status":         "success",
+                "job_id":         jid,
+                "job_status":     job.status,
+                "start_time":     str(job.start_time),
+                "end_time":       str(job.end_time),
+                "location_count": results.get("location_count", len(locations_clean)),
+                "locations":      locations_clean,
             }
+            if "comparison_summary" in results:
+                response["comparison_summary"] = results["comparison_summary"]
+            return response
 
         return {
             "job_id":     jid,
@@ -984,5 +1013,51 @@ def get_results(jid: str) -> dict:
         raise
     except Exception as e:
         logger.error(f"GET /results/{jid}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/results/{jid}/plot")
+def get_result_plot(jid: str) -> Response:
+    """Return the combined irradiance plot for a finished job as a PNG image.
+
+    All locations in the job are drawn on a single chart for easy comparison.
+    Open directly in a browser:
+        http://<host>/results/<jid>/plot
+
+    Args:
+        jid (str): UUID of the job.
+
+    Returns:
+        PNG image (Content-Type: image/png).
+    """
+    try:
+        try:
+            job = get_job_by_id(jid)
+        except Exception:
+            raise HTTPException(status_code=404, detail=f"Job '{jid}' not found")
+
+        if not job.status.startswith("FINISHED -- SUCCESS"):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Plot not available — job status is '{job.status}'. Wait for FINISHED -- SUCCESS.",
+            )
+
+        results = get_job_result(jid)
+        if results is None:
+            raise HTTPException(status_code=404, detail="Job result not found in Redis.")
+
+        plot_b64 = results.get("irradiance_plot_base64")
+        if not plot_b64:
+            raise HTTPException(status_code=404, detail="No plot stored for this job.")
+
+        png_bytes = base64.b64decode(plot_b64)
+        return Response(content=png_bytes, media_type="image/png")
+
+    except redis.ConnectionError as e:
+        raise HTTPException(status_code=500, detail=f"Redis connection error: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /results/{jid}/plot: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 

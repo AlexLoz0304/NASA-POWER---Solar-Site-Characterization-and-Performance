@@ -1,0 +1,32 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-power-test-fastapi
+  namespace: alozano0304
+  labels:
+    app: nasa-power-test-fastapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nasa-power-test-fastapi
+  template:
+    metadata:
+      labels:
+        app: nasa-power-test-fastapi
+    spec:
+      containers:
+        - name: nasa-power-test-fastapi
+          image: alozano0304/nasa-power-api:1.0
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: REDIS_HOST
+              value: nasa-power-test-redis-service
+            - name: REDIS_PORT
+              value: "6379"
+            - name: LOG_LEVEL
+              value: DEBUG

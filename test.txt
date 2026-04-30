@@ -1,0 +1,172 @@
+================================================================================
+  NASA POWER Solar API — Manual End-to-End Test Script
+  Copy-paste each block into your terminal after the Kubernetes deployment is up.
+================================================================================
+
+BASE="http://alozano0304-nasa-power-test.coe332.tacc.cloud"
+
+# ── 0. Flush Redis ────────────────────────────────────────────────────────────
+kubectl exec -n alozano0304 deploy/nasa-power-test-redis -- redis-cli FLUSHALL
+
+
+# ── 1. Health check ───────────────────────────────────────────────────────────
+curl -s $BASE/health | python3 -m json.tool
+
+
+# ── 2. Add locations ──────────────────────────────────────────────────────────
+
+# 2a. Seattle, WA
+curl -s -X POST $BASE/locations \
+  -H "Content-Type: application/json" \
+  -d '{"lat": 47.6, "lon": -122.3, "name": "Seattle"}' | python3 -m json.tool
+
+# 2b. Phoenix, AZ
+curl -s -X POST $BASE/locations \
+  -H "Content-Type: application/json" \
+  -d '{"lat": 33.4, "lon": -112.1, "name": "Phoenix"}' | python3 -m json.tool
+
+# 2c. Miami, FL
+curl -s -X POST $BASE/locations \
+  -H "Content-Type: application/json" \
+  -d '{"lat": 25.8, "lon": -80.2, "name": "Miami"}' | python3 -m json.tool
+
+# 2d. Same snapped grid cell as Seattle but a different name (tests duplicate-snap behaviour)
+curl -s -X POST $BASE/locations \
+  -H "Content-Type: application/json" \
+  -d '{"lat": 47.55, "lon": -122.27, "name": "Seattle-Downtown"}' | python3 -m json.tool
+
+# 2e. Reykjavik, Iceland (high-latitude, low-irradiance control)
+curl -s -X POST $BASE/locations \
+  -H "Content-Type: application/json" \
+  -d '{"lat": 64.1, "lon": -21.9, "name": "Reykjavik"}' | python3 -m json.tool
+
+
+# ── 3. List all stored locations ──────────────────────────────────────────────
+curl -s $BASE/locations | python3 -m json.tool
+
+
+# ── 4. Look up a single location by snapped coordinates ───────────────────────
+# (Seattle snaps to 47.5, -122.5)
+curl -s "$BASE/locations/47.6/-122.3" | python3 -m json.tool
+
+
+# ── 5. 404 on unknown location ────────────────────────────────────────────────
+curl -s "$BASE/locations/0.0/0.0"
+
+
+# ── 6. Submit jobs ────────────────────────────────────────────────────────────
+# Save IDs first (run steps 2a–2e and grab the "id" fields, then substitute below)
+
+# --- PASTE LOCATION IDS HERE ---
+LOC_SEATTLE="<paste-seattle-id>"
+LOC_PHOENIX="<paste-phoenix-id>"
+LOC_MIAMI="<paste-miami-id>"
+LOC_SEATTLE_DT="<paste-seattle-downtown-id>"
+LOC_REYKJAVIK="<paste-reykjavik-id>"
+
+# 6a. Single-location job (Seattle only)
+JOB1=$(curl -s -X POST $BASE/jobs \
+  -H "Content-Type: application/json" \
+  -d "{\"location_ids\": [\"$LOC_SEATTLE\"]}" | python3 -m json.tool)
+echo "$JOB1"
+JID1=$(echo "$JOB1" | python3 -c "import sys,json; print(json.load(sys.stdin)['jid'])")
+
+# 6b. Two-location comparison job (Phoenix vs Miami)
+JOB2=$(curl -s -X POST $BASE/jobs \
+  -H "Content-Type: application/json" \
+  -d "{\"location_ids\": [\"$LOC_PHOENIX\", \"$LOC_MIAMI\"]}" | python3 -m json.tool)
+echo "$JOB2"
+JID2=$(echo "$JOB2" | python3 -c "import sys,json; print(json.load(sys.stdin)['jid'])")
+
+# 6c. Three-location comparison job (Seattle, Phoenix, Reykjavik)
+JOB3=$(curl -s -X POST $BASE/jobs \
+  -H "Content-Type: application/json" \
+  -d "{\"location_ids\": [\"$LOC_SEATTLE\", \"$LOC_PHOENIX\", \"$LOC_REYKJAVIK\"]}" | python3 -m json.tool)
+echo "$JOB3"
+JID3=$(echo "$JOB3" | python3 -c "import sys,json; print(json.load(sys.stdin)['jid'])")
+
+# 6d. Same snapped grid cell (Seattle + Seattle-Downtown) — should produce identical per-location data
+JOB4=$(curl -s -X POST $BASE/jobs \
+  -H "Content-Type: application/json" \
+  -d "{\"location_ids\": [\"$LOC_SEATTLE\", \"$LOC_SEATTLE_DT\"]}" | python3 -m json.tool)
+echo "$JOB4"
+JID4=$(echo "$JOB4" | python3 -c "import sys,json; print(json.load(sys.stdin)['jid'])")
+
+
+# ── 7. List all jobs ──────────────────────────────────────────────────────────
+curl -s $BASE/jobs | python3 -m json.tool
+
+
+# ── 8. Poll job status ────────────────────────────────────────────────────────
+curl -s $BASE/jobs/$JID1 | python3 -m json.tool
+curl -s $BASE/jobs/$JID2 | python3 -m json.tool
+curl -s $BASE/jobs/$JID3 | python3 -m json.tool
+curl -s $BASE/jobs/$JID4 | python3 -m json.tool
+
+
+# ── 9. Get results (poll until FINISHED -- SUCCESS) ───────────────────────────
+
+# 9a. Single-location result — check shape has "locations" array with 1 entry
+curl -s $BASE/results/$JID1 | python3 -m json.tool
+
+# 9b. Two-location result — check comparison_summary.ranked has 2 entries
+curl -s $BASE/results/$JID2 | python3 -m json.tool
+
+# 9c. Three-location result — check comparison_summary.best_site and narrative
+curl -s $BASE/results/$JID3 | python3 -m json.tool
+
+# 9d. Same snapped cell — mean_irradiance should be identical for both locations
+curl -s $BASE/results/$JID4 | python3 -m json.tool
+
+
+# ── 10. View combined irradiance plots in browser ────────────────────────────
+echo "Open in browser:"
+echo "  $BASE/results/$JID1/plot   (Seattle only)"
+echo "  $BASE/results/$JID2/plot   (Phoenix vs Miami)"
+echo "  $BASE/results/$JID3/plot   (Seattle vs Phoenix vs Reykjavik)"
+echo "  $BASE/results/$JID4/plot   (Seattle vs Seattle-Downtown — lines should overlap)"
+
+
+# ── 11. Error cases ───────────────────────────────────────────────────────────
+
+# 11a. Missing required field (should 422)
+curl -s -X POST $BASE/jobs -H "Content-Type: application/json" -d '{}'
+
+# 11b. Empty location_ids (should 422)
+curl -s -X POST $BASE/jobs -H "Content-Type: application/json" -d '{"location_ids": []}'
+
+# 11c. Unknown location UUID (should 404)
+curl -s -X POST $BASE/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"location_ids": ["00000000-0000-0000-0000-000000000000"]}'
+
+# 11d. Result for non-existent job (should 404)
+curl -s $BASE/results/00000000-0000-0000-0000-000000000000
+
+# 11e. Plot for non-existent job (should 404)
+curl -s $BASE/results/00000000-0000-0000-0000-000000000000/plot
+
+
+# ── 12. Re-run the pytest suite to confirm everything still passes ────────────
+uv run pytest test/ -v
+
+
+================================================================================
+  Expected assertions
+================================================================================
+  ✅  GET /health           → {"status": "ok", ...}
+  ✅  POST /locations       → {id, snapped_lat, snapped_lon, name, ...}
+  ✅  GET /locations        → {locations: [{id, name, start_date, end_date, ...}]}
+  ✅  GET /locations/47.6/-122.3 → {name: "Seattle", snapped_lat: 47.5, ...}
+  ✅  GET /locations/0.0/0.0    → 404
+  ✅  POST /jobs (1 loc)    → {jid, status:"QUEUED", location_ids:[...]}
+  ✅  POST /jobs (2+ locs)  → same shape, location_ids has N entries
+  ✅  POST /jobs empty ids  → 422
+  ✅  GET /jobs/{jid}       → {jid, status, ...}
+  ✅  GET /results/{jid}    → {location_count, locations:[...]} — NO plot blob
+  ✅  GET /results (2 locs) → comparison_summary.ranked has 2 entries
+  ✅  GET /results (3 locs) → comparison_summary.best_site.name == "Phoenix"
+  ✅  GET /results (same snap) → both irradiance means are equal
+  ✅  GET /results/{jid}/plot  → PNG binary (Content-Type: image/png)
+  ✅  Unknown job/location  → 404
+================================================================================

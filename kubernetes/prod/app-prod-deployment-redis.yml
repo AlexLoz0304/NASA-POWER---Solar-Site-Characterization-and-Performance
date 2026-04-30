@@ -1,0 +1,32 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nasa-power-prod-redis
+  namespace: alozano0304
+  labels:
+    app: nasa-power-prod-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nasa-power-prod-redis
+  template:
+    metadata:
+      labels:
+        app: nasa-power-prod-redis
+    spec:
+      containers:
+        - name: nasa-power-prod-redis
+          image: redis:7
+          ports:
+            - name: redis
+              containerPort: 6379
+          args: ["--save", "1", "1"]
+          volumeMounts:
+            - name: nasa-power-prod-redis-data
+              mountPath: /data
+      volumes:
+        - name: nasa-power-prod-redis-data
+          persistentVolumeClaim:
+            claimName: nasa-power-prod-redis-data
