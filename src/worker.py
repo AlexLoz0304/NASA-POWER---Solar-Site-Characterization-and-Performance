@@ -19,6 +19,7 @@ For each job the worker:
         • Clear-sky utilisation ratio (actual / theoretical clear-sky irradiance).
         • Solar variability index (std/mean of daily irradiance).
         • GHI-based PV suitability score.
+        • Multi-factor PV suitability score (GHI 40%, Clearness Index 25%, Temperature 20%, Cloud Cover 15%).
         • Per-parameter sentinel counts (missing/invalid NASA POWER days).
   5. If the job payload contained multiple location_ids (POST /jobs body),
      all locations are analysed in a single job. A combined overlay plot is
@@ -310,25 +311,82 @@ def _solar_variability_index(irradiance_series: list) -> Optional[float]:
     return round(statistics.stdev(cleaned) / m, 4)
 
 
-def _ghi_suitability_score(mean_ghi: float) -> dict:
-    """GHI-based PV site suitability score from 0–10.
+def _pv_suitability_score(mean_ghi: float,
+                          mean_kt:    Optional[float],
+                          mean_temp:  float,
+                          mean_cloud: Optional[float]) -> dict:
+    """Multi-factor PV site suitability score from 0–10.
 
-    Calibrated so that 7 kWh/m²/day (high-desert irradiance) scores 10.
-    Useful for ranking candidate sites at a glance.
+    Combines four independent sub-scores with fixed weights:
+
+        Component            Weight  Rationale
+        ─────────────────────────────────────────────────────────
+        GHI (irradiance)      40 %   Primary energy driver
+        Clearness Index (KT)  25 %   Sky clarity & predictability
+        Temperature           20 %   Heat de-rates panel efficiency
+        Cloud Cover           15 %   Direct production penalty
+
+    Sub-score formulas
+    ──────────────────
+    • GHI:         min(10, G̅ / 7 × 10)          — 7 kWh/m²/day → 10
+    • KT:          min(10, KT / 0.65 × 10)       — 0.65 (desert clear sky) → 10
+    • Temperature: 10 − clamp(0, (T̅ − 25)×0.4, 5) — 25 °C (STC) → 10, 37.5 °C → 5
+    • Cloud:       min(10, (100 − C̅) / 10)       — 0 % cloud → 10, 100 % → 0
+
+    Each component score is kept on [0, 10] before weighting.
     """
-    score = round(min(10.0, mean_ghi * 10.0 / 7.0), 1)
-    if score >= 8:
+    # --- GHI component (40%) ---
+    ghi_score = min(10.0, mean_ghi / 7.0 * 10.0)
+
+    # --- Clearness Index component (25%) ---
+    if mean_kt is not None:
+        kt_score = min(10.0, mean_kt / 0.65 * 10.0)
+    else:
+        kt_score = ghi_score  # fallback: mirror GHI if KT unavailable
+
+    # --- Temperature component (20%) ---
+    # Penalise at 0.4 %/°C above 25 °C STC, capped at a 5-point penalty
+    temp_penalty = min(5.0, max(0.0, (mean_temp - STC_TEMP) * 0.4))
+    temp_score   = 10.0 - temp_penalty
+
+    # --- Cloud Cover component (15%) ---
+    if mean_cloud is not None:
+        cloud_score = min(10.0, max(0.0, (100.0 - mean_cloud) / 10.0))
+    else:
+        cloud_score = kt_score  # fallback: mirror KT if cloud data unavailable
+
+    # --- Weighted composite ---
+    composite = (
+        0.40 * ghi_score  +
+        0.25 * kt_score   +
+        0.20 * temp_score +
+        0.15 * cloud_score
+    )
+    composite = round(composite, 1)
+
+    if composite >= 8:
         label = "Excellent"
-    elif score >= 6:
+    elif composite >= 6:
         label = "Good"
-    elif score >= 4:
+    elif composite >= 4:
         label = "Moderate"
     else:
         label = "Poor"
+
     return {
-        "score": score,
-        "label": label,
-        "note": "Score 0–10: ≥8 Excellent, ≥6 Good, ≥4 Moderate, <4 Poor. 7 kWh/m²/day = 10.",
+        "score":            composite,
+        "label":            label,
+        "components": {
+            "ghi_score":   round(ghi_score,   1),
+            "kt_score":    round(kt_score,    1),
+            "temp_score":  round(temp_score,  1),
+            "cloud_score": round(cloud_score, 1),
+        },
+        "weights": {"ghi": 0.40, "clearness_index": 0.25, "temperature": 0.20, "cloud_cover": 0.15},
+        "note": (
+            "Multi-factor score 0–10: ≥8 Excellent, ≥6 Good, ≥4 Moderate, <4 Poor. "
+            "Factors: GHI 40%, Clearness Index 25%, Temperature 20%, Cloud Cover 15%."
+        ),
     }
 
 
@@ -488,8 +546,13 @@ def _analyze_location(record: dict) -> dict:
             "daily_average": mean_irr,
             "note": "Peak sun hours/day ≈ mean GHI (kWh/m²/day). Use to size PV arrays: array_kWp = daily_load_kWh / PSH.",
         },
-        # Simple GHI-based site suitability score for quick comparison
-        "pv_suitability": _ghi_suitability_score(mean_irr),
+        # Multi-factor PV site suitability score
+        "pv_suitability": _pv_suitability_score(
+            mean_ghi=mean_irr,
+            mean_kt=mean_kt,
+            mean_temp=mean_temp,
+            mean_cloud=_smean(series["CLOUD_AMT"]),
+        ),
     }
     return result
 
