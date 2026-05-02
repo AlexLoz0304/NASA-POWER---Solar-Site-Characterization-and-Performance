@@ -257,6 +257,28 @@ def add_job(location_ids: typing.List[str],
     return job
 
 
+def update_job_dates(jid: str, start_date: str, end_date: str) -> bool:
+    """
+    Update a job's start_date and end_date fields in Redis db=2.
+
+    Called by the worker after processing all locations to set the actual
+    date range covered (earliest start across all locations, latest end).
+
+    Args:
+        jid        (str): The job UUID to update.
+        start_date (str): The earliest start date in YYYYMMDD format.
+        end_date   (str): The latest end date in YYYYMMDD format.
+
+    Returns:
+        bool: True if the update was persisted successfully.
+    """
+    job = get_job_by_id(jid)
+    job.start_date = start_date
+    job.end_date   = end_date
+    logger.debug(f"Updated job {jid} dates: {start_date} -> {end_date}")
+    return _save_job(jid, job)
+
+
 def start_job(jid: str) -> Job:
     """
     Mark a job as RUNNING and record its start timestamp.

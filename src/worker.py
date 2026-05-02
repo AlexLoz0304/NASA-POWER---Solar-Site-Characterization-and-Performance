@@ -56,6 +56,7 @@ from jobs import (
     rdb,
     save_job_result,
     start_job,
+    update_job_dates,
     update_job_status,
 )
 
@@ -709,7 +710,19 @@ def do_work(jid: str | None = None) -> None:
 
         save_job_result(jid, combined)
 
-        # --- Step 4: Mark SUCCESS ---
+        # --- Step 4: Update job date range from actual location data ---
+        # Collect all start/end dates from the processed location records,
+        # then store the earliest start and latest end on the job itself.
+        loc_starts = [r.get("start_date") for r in all_loc_records if r.get("start_date")]
+        loc_ends   = [r.get("end_date")   for r in all_loc_records if r.get("end_date")]
+        if loc_starts and loc_ends:
+            try:
+                update_job_dates(jid, min(loc_starts), max(loc_ends))
+                logger.info(f"[JOB DATES] {jid} — {min(loc_starts)} -> {max(loc_ends)}")
+            except Exception as date_err:
+                logger.warning(f"[JOB DATES WARN] {jid}: could not update dates — {date_err}")
+
+        # --- Step 5: Mark SUCCESS ---
         update_job_status(jid, JobStatus.SUCCESS)
         logger.info(f"[JOB DONE] {jid} — SUCCESS | {len(location_results)} location(s) analysed")
 

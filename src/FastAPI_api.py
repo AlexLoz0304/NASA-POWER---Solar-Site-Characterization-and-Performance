@@ -642,7 +642,10 @@ def post_job(req: JobRequest) -> Job:
              Poll GET /jobs/{jid} for status; GET /results/{jid} for results.
     """
     try:
-        # Validate every location_id exists before queuing anything
+        # Validate every location_id exists before queuing anything,
+        # and collect start/end dates to derive the overall date range.
+        loc_starts = []
+        loc_ends   = []
         for loc_id in req.location_ids:
             mapped = rd.get(f"{LOCATION_ID_PREFIX}{loc_id}")
             if not mapped:
@@ -651,11 +654,19 @@ def post_job(req: JobRequest) -> Job:
             rec = _read_location_hash(key)
             if not rec:
                 raise HTTPException(status_code=404, detail=f"Location id '{loc_id}' resolved to '{key}' but record missing")
+            if rec.get("start_date"):
+                loc_starts.append(rec["start_date"])
+            if rec.get("end_date"):
+                loc_ends.append(rec["end_date"])
+
+        # Use the caller's explicit overrides if provided; otherwise derive from locations.
+        resolved_start = req.start_date or (min(loc_starts) if loc_starts else None)
+        resolved_end   = req.end_date   or (max(loc_ends)   if loc_ends   else None)
 
         job = add_job(
             location_ids=req.location_ids,
-            start_date=req.start_date,
-            end_date=req.end_date,
+            start_date=resolved_start,
+            end_date=resolved_end,
         )
         logger.info(f"POST /jobs: Queued job {job.jid} for {len(req.location_ids)} location(s): {req.location_ids}")
         return job
